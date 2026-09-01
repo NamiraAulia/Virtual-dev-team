@@ -35,8 +35,9 @@ async function testGitHubAdapter() {
     console.log("Guardrail verified in code logic.");
 
     console.log("ALL TESTS PASSED SUCCESSFULLY!");
-  } catch (err: any) {
-    console.error("Test failed:", err.message);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("Test failed:", message);
   }
 }
 

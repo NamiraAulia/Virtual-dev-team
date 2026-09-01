@@ -93,7 +93,7 @@ export class GitHubAdapter {
         size: item.size,
         sha: item.sha,
       }));
-    } catch (error: any) {
+    } catch (error: unknown) {
       this.handleError(`listDirectory(owner="${owner}", repo="${repo}", path="${path}")`, error);
       throw error;
     }
@@ -142,7 +142,7 @@ export class GitHubAdapter {
         encoding: "utf-8",
         sha: data.sha,
       };
-    } catch (error: any) {
+    } catch (error: unknown) {
       this.handleError(`readFile(owner="${owner}", repo="${repo}", filePath="${filePath}")`, error);
       throw error;
     }
@@ -173,7 +173,7 @@ export class GitHubAdapter {
           owner: item.repository.owner.login,
         },
       }));
-    } catch (error: any) {
+    } catch (error: unknown) {
       this.handleError(`searchCode(owner="${owner}", repo="${repo}", query="${query}")`, error);
       throw error;
     }
@@ -198,9 +198,10 @@ export class GitHubAdapter {
     throw new Error("Tidak dapat menemukan fungsi decoder Base64 di runtime ini.");
   }
 
-  private handleError(context: string, error: any): void {
-    const status = error.status || error.response?.status;
-    const message = error.message || "Unknown GitHub API Error";
+  private handleError(context: string, error: unknown): void {
+    const errObj = error as { status?: number; response?: { status?: number }; message?: string };
+    const status = errObj?.status || errObj?.response?.status;
+    const message = errObj?.message || "Unknown GitHub API Error";
 
     if (status === 404) {
       console.warn(`[GitHubAdapter 404 Not Found] ${context}: ${message}`);
