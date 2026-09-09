@@ -86,6 +86,16 @@ def get_task(
     return TaskDetailResponse(task=task, patches=patches)
 
 
+from app.use_cases.patch_generator import (
+    PatchGeneratorUseCase,
+    TaskNotFoundError,
+    InvalidTaskStatusError,
+    ExplorationExecutionError,
+)
+
+patch_generator_use_case = PatchGeneratorUseCase()
+
+
 @router.post("/{task_id}/run", response_model=TaskRecord)
 async def run_task(
     task_id: str,
@@ -93,38 +103,26 @@ async def run_task(
     settings: Settings = Depends(get_settings),
 ) -> TaskRecord:
     """
-    Trigger AI exploration for a task.
-    Invokes GeminiEngine.run_exploration() with Gemini 2.0 Flash and GitHub tools.
+    Trigger AI exploration for a task via PatchGeneratorUseCase.
+    Coordinates Supabase, Gemini 2.0 Flash engine, GitHub tools, and audit logs.
     """
-    task = db.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
-
-    if task.status != TaskStatus.PENDING:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Task must be in 'pending' status to run. Current: '{task.status.value}'",
-        )
-
-    # Update status to exploring
-    db.update_task_status(task_id, TaskStatus.EXPLORING)
-    task = db.get_task(task_id) or task
-
     try:
-        github = GitHubAdapter(settings.github_personal_access_token, task.repo_full_name)
-        engine = GeminiEngine(settings.google_generative_ai_api_key, github)
-        patch_set = await engine.run_exploration(task, db=db)
-        db.save_patches(patch_set.actions, task_id)
-        updated = db.update_task_status(task_id, TaskStatus.PATCH_READY)
-        logger.info("API: Task id=%s exploration completed, status set to patch_ready", task_id)
-        return updated or task
-    except Exception as err:
-        logger.error("API: Exploration failed for task id=%s: %s", task_id, err, exc_info=True)
-        db.update_task_status(task_id, TaskStatus.PENDING)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Autonomous AI exploration failed: {err}",
+        updated_task, _ = await patch_generator_use_case.execute(
+            task_id=task_id,
+            db=db,
+            settings=settings,
         )
+        return updated_task
+    except TaskNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidTaskStatusError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ExplorationExecutionError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error("API: Unexpected error in run_task for task id=%s: %s", task_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
 
 
 @router.post("/{task_id}/approve", response_model=ApproveResponse)

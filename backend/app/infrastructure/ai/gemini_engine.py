@@ -5,7 +5,9 @@ Gemini AI Engine.
 
 Autonomous agentic loop powered by Google Gemini 2.0 Flash (temperature: 0).
 Uses function-calling with GitHubAdapter tools (list_directory, read_file, search_code)
-to explore a repository and generate structured PatchSets. Enforces a 5-round guardrail.
+to explore a repository and generate structured PatchSets conforming to PatchProposal schema.
+Includes local verification (search_block exact match) and self-repair retry loop.
+Enforces a 5-round exploration guardrail and 2-attempt self-repair limit.
 """
 
 import json
@@ -19,7 +21,7 @@ from google import genai
 # pyrefly: ignore [missing-import]
 from google.genai import types
 
-from app.domain.patch import PatchAction, PatchSet
+from app.domain.patch import PatchAction, PatchProposal, PatchSet
 from app.domain.task import TaskRecord
 from app.domain.task_log import TaskLogEntry
 from app.infrastructure.database.supabase_client import SupabaseClient
@@ -56,8 +58,9 @@ Your final response MUST be a valid JSON object matching this schema (do NOT inc
   ]
 }
 ```
+
 Important Rules for search_block:
-- search_block must match the exact indentation and text currently in the file.
+- search_block must match the exact indentation, whitespace, and lines currently in the file.
 - Keep search_block concise and uniquely identifiable.
 """
 
@@ -70,11 +73,13 @@ class GeminiEngine:
         - model: gemini-2.0-flash
         - temperature: 0 (deterministic output)
         - max_tool_rounds: 5 (guardrail against infinite loops)
+        - max_repair_attempts: 2 (self-repair retry limit on verification failure)
     """
 
     MODEL_NAME = "gemini-2.0-flash"
     TEMPERATURE = 0.0
     MAX_TOOL_ROUNDS = 5
+    MAX_REPAIR_ATTEMPTS = 2
 
     def __init__(
         self,
@@ -86,11 +91,12 @@ class GeminiEngine:
         self._github = github_adapter
         self._client = client or genai.Client(api_key=api_key)
         logger.info(
-            "GeminiEngine initialized for repo '%s' with model '%s' (temp=%s, max_rounds=%d)",
+            "GeminiEngine initialized for repo '%s' with model '%s' (temp=%s, max_rounds=%d, max_repairs=%d)",
             github_adapter.repo_full_name,
             self.MODEL_NAME,
             self.TEMPERATURE,
             self.MAX_TOOL_ROUNDS,
+            self.MAX_REPAIR_ATTEMPTS,
         )
 
     def _get_tools(self) -> list[Any]:
@@ -169,7 +175,7 @@ class GeminiEngine:
             raise ValueError("AI response does not contain any patch actions.")
 
         actions = [
-            PatchAction(
+            PatchProposal(
                 file_path=a.get("file_path", ""),
                 search_block=a.get("search_block", ""),
                 replace_block=a.get("replace_block", ""),
@@ -184,6 +190,112 @@ class GeminiEngine:
             actions=actions,
         )
 
+    def verify_patch_locally(self, patch_set: PatchSet) -> tuple[bool, str | None]:
+        """
+        Verify that all proposed patch actions are valid against the actual repository files.
+        Checks:
+        1. Target file exists and can be read.
+        2. action.search_block exactly exists in the file content.
+        """
+        for action in patch_set.actions:
+            try:
+                file_data = self._github.read_file(file_path=action.file_path)
+                content = file_data.get("content", "")
+            except Exception as e:
+                return False, f"File '{action.file_path}' could not be read or does not exist: {e}"
+
+            if not action.search_block:
+                return False, f"search_block in '{action.file_path}' is empty."
+
+            if action.search_block not in content:
+                return False, (
+                    f"search_block was not found in file '{action.file_path}'. "
+                    f"Ensure exact indentation and line breaks matching the original file."
+                )
+
+        return True, None
+
+    async def _resolve_and_verify_patch_set(
+        self,
+        response_text: str,
+        task: TaskRecord,
+        contents: list[types.Content],
+    ) -> PatchSet:
+        """
+        Extracts PatchSet, verifies locally, and triggers self-repair retries if verification fails.
+        """
+        current_text = response_text
+        repair_attempt = 0
+
+        while True:
+            error_message: str | None = None
+            candidate_patch_set: PatchSet | None = None
+
+            try:
+                candidate_patch_set = self._extract_patch_set(current_text, task.id)
+                is_valid, verify_err = self.verify_patch_locally(candidate_patch_set)
+                if not is_valid:
+                    error_message = verify_err
+            except Exception as parse_err:
+                error_message = f"Invalid PatchSet format: {parse_err}"
+
+            # If valid and verified, return immediately
+            if candidate_patch_set is not None and error_message is None:
+                logger.info("Task id=%s | PatchSet successfully verified locally.", task.id)
+                return candidate_patch_set
+
+            # If validation failed and we still have repair attempts remaining:
+            if repair_attempt < self.MAX_REPAIR_ATTEMPTS:
+                repair_attempt += 1
+                logger.warning(
+                    "Task id=%s | Patch verification failed: %s. Initiating self-repair attempt %d/%d.",
+                    task.id,
+                    error_message,
+                    repair_attempt,
+                    self.MAX_REPAIR_ATTEMPTS,
+                )
+
+                repair_prompt = (
+                    f"Your proposed patch failed local verification with the following error:\n"
+                    f"{error_message}\n\n"
+                    f"Please review the error, inspect the target file if needed, and output a corrected, "
+                    f"valid PatchSet JSON conforming strictly to the PatchProposal schema."
+                )
+
+                contents.append(
+                    types.Content(role="user", parts=[types.Part.from_text(text=repair_prompt)])
+                )
+
+                repair_config = types.GenerateContentConfig(
+                    temperature=self.TEMPERATURE,
+                    system_instruction=SYSTEM_INSTRUCTION,
+                )
+
+                repair_response = self._client.models.generate_content(
+                    model=self.MODEL_NAME,
+                    contents=contents,
+                    config=repair_config,
+                )
+
+                if repair_response.candidates and repair_response.candidates[0].content:
+                    contents.append(repair_response.candidates[0].content)
+
+                current_text = repair_response.text or ""
+            else:
+                logger.error(
+                    "Task id=%s | Max self-repair attempts (%d) reached. Last error: %s",
+                    task.id,
+                    self.MAX_REPAIR_ATTEMPTS,
+                    error_message,
+                )
+                if candidate_patch_set is not None:
+                    raise ValueError(
+                        f"PatchSet failed local verification after {self.MAX_REPAIR_ATTEMPTS} repair attempts: {error_message}"
+                    )
+                raise ValueError(
+                    f"Failed to parse valid PatchSet JSON after {self.MAX_REPAIR_ATTEMPTS} repair attempts: {error_message}"
+                )
+
     async def run_exploration(
         self,
         task: TaskRecord,
@@ -194,7 +306,7 @@ class GeminiEngine:
         1. Send task description + tools to Gemini 2.0 Flash (temp: 0).
         2. Loop: if Gemini requests tool call -> execute tool -> return output -> repeat.
         3. Enforce 5-round guardrail.
-        4. When Gemini finishes, parse and return structured PatchSet.
+        4. When Gemini finishes, parse and locally verify structured PatchSet (with self-repair retry).
         """
         logger.info(
             "Starting autonomous exploration for task id=%s title='%s'",
@@ -252,7 +364,7 @@ class GeminiEngine:
                 # No function calls -> Model produced final response
                 logger.info("Task id=%s | Model produced final response in round %d.", task.id, round_counter)
                 response_text = response.text or ""
-                return self._extract_patch_set(response_text, task.id)
+                return await self._resolve_and_verify_patch_set(response_text, task, contents)
 
             # Execute tool calls and build function responses
             tool_response_parts: list[types.Part] = []
@@ -322,5 +434,8 @@ class GeminiEngine:
             config=final_config,
         )
 
+        if final_response.candidates and final_response.candidates[0].content:
+            contents.append(final_response.candidates[0].content)
+
         response_text = final_response.text or ""
-        return self._extract_patch_set(response_text, task.id)
+        return await self._resolve_and_verify_patch_set(response_text, task, contents)

@@ -3,10 +3,12 @@ import unittest
 from unittest.mock import MagicMock
 from datetime import datetime, timezone
 
+# pyrefly: ignore [missing-import]
 from google.genai import types
 
+
 from app.domain.task import TaskRecord, TaskStatus
-from app.domain.patch import PatchSet, PatchAction
+from app.domain.patch import PatchSet, PatchAction, PatchProposal
 from app.infrastructure.ai.gemini_engine import GeminiEngine
 from app.infrastructure.github.adapter import GitHubAdapter
 
@@ -43,6 +45,7 @@ class TestGeminiEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.MODEL_NAME, "gemini-2.0-flash")
         self.assertEqual(engine.TEMPERATURE, 0.0)
         self.assertEqual(engine.MAX_TOOL_ROUNDS, 5)
+        self.assertEqual(engine.MAX_REPAIR_ATTEMPTS, 2)
 
         tools = engine._get_tools()
         self.assertEqual(len(tools), 3)
@@ -92,6 +95,61 @@ class TestGeminiEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(patch_set.actions[0].search_block, "print('error')")
         self.assertEqual(patch_set.actions[0].replace_block, "print('success')")
 
+    def test_verify_patch_locally_success(self):
+        engine = GeminiEngine(api_key="dummy-key", github_adapter=self.mock_github)
+        patch_set = PatchSet(
+            task_id="test-task-1",
+            summary="Valid patch",
+            actions=[
+                PatchProposal(
+                    file_path="main.py",
+                    search_block="print('error')",
+                    replace_block="print('info')",
+                    explanation="Fix statement",
+                )
+            ],
+        )
+        is_valid, error = engine.verify_patch_locally(patch_set)
+        self.assertTrue(is_valid)
+        self.assertIsNone(error)
+
+    def test_verify_patch_locally_mismatch(self):
+        engine = GeminiEngine(api_key="dummy-key", github_adapter=self.mock_github)
+        patch_set = PatchSet(
+            task_id="test-task-1",
+            summary="Invalid search_block",
+            actions=[
+                PatchProposal(
+                    file_path="main.py",
+                    search_block="non_existent_code_line()",
+                    replace_block="print('info')",
+                    explanation="Fix statement",
+                )
+            ],
+        )
+        is_valid, error = engine.verify_patch_locally(patch_set)
+        self.assertFalse(is_valid)
+        self.assertIn("search_block was not found in file 'main.py'", error)
+
+    def test_verify_patch_locally_missing_file(self):
+        self.mock_github.read_file.side_effect = FileNotFoundError("File not found on remote")
+        engine = GeminiEngine(api_key="dummy-key", github_adapter=self.mock_github)
+        patch_set = PatchSet(
+            task_id="test-task-1",
+            summary="Missing file",
+            actions=[
+                PatchProposal(
+                    file_path="missing.py",
+                    search_block="foo()",
+                    replace_block="bar()",
+                    explanation="Fix",
+                )
+            ],
+        )
+        is_valid, error = engine.verify_patch_locally(patch_set)
+        self.assertFalse(is_valid)
+        self.assertIn("could not be read or does not exist", error)
+
     async def test_run_exploration_autonomous_loop(self):
         mock_client = MagicMock()
 
@@ -134,6 +192,53 @@ class TestGeminiEngine(unittest.IsolatedAsyncioTestCase):
         self.mock_github.search_code.assert_called_once_with(query="error")
         # Verify audit log was recorded
         mock_db.append_log.assert_called_once()
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
+
+    async def test_self_repair_retry_flow(self):
+        mock_client = MagicMock()
+
+        # Turn 1: AI outputs an invalid search block (mismatch)
+        bad_json = json.dumps({
+            "summary": "Attempt with wrong search_block",
+            "actions": [
+                {
+                    "file_path": "main.py",
+                    "search_block": "print('WRONG_TEXT_NOT_IN_FILE')",
+                    "replace_block": "print('info')",
+                    "explanation": "Attempt 1",
+                }
+            ]
+        })
+        resp1 = MagicMock()
+        resp1.candidates = [MagicMock(content=types.Content(role="model", parts=[types.Part.from_text(text=bad_json)]))]
+        resp1.function_calls = None
+        resp1.text = bad_json
+
+        # Turn 2: Self-repair response with corrected search_block
+        good_json = json.dumps({
+            "summary": "Self-repaired patch with exact search_block",
+            "actions": [
+                {
+                    "file_path": "main.py",
+                    "search_block": "print('error')",
+                    "replace_block": "print('info')",
+                    "explanation": "Corrected in repair turn",
+                }
+            ]
+        })
+        resp2 = MagicMock()
+        resp2.candidates = [MagicMock(content=types.Content(role="model", parts=[types.Part.from_text(text=good_json)]))]
+        resp2.function_calls = None
+        resp2.text = good_json
+
+        mock_client.models.generate_content.side_effect = [resp1, resp2]
+
+        engine = GeminiEngine(api_key="dummy-key", github_adapter=self.mock_github, client=mock_client)
+        patch_set = await engine.run_exploration(self.sample_task)
+
+        self.assertEqual(patch_set.summary, "Self-repaired patch with exact search_block")
+        self.assertEqual(patch_set.actions[0].search_block, "print('error')")
+        # 1 initial call + 1 repair call
         self.assertEqual(mock_client.models.generate_content.call_count, 2)
 
     async def test_guardrail_5_rounds_limit(self):
