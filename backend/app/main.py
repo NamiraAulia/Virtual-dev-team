@@ -25,7 +25,7 @@ logging.basicConfig(
 
 app = FastAPI(
     title="Autonomous AI Dev Engine",
-    description="AI-powered autonomous code maintenance platform with Human-in-the-Loop approval.",
+    description="Sprint 3 Autonomous Platform with Human-in-the-Loop",
     version="0.1.0",
 )
 
