@@ -16,6 +16,7 @@ from app.config import Settings, get_settings
 from app.domain.patch import PatchRecord
 from app.domain.task import TaskCreate, TaskRecord, TaskStatus
 from app.domain.task_log import TaskLogEntry
+from app.infrastructure.ai.gemini_engine import GeminiEngine
 from app.infrastructure.database.supabase_client import SupabaseClient
 from app.infrastructure.github.adapter import GitHubAdapter
 
@@ -93,7 +94,7 @@ async def run_task(
 ) -> TaskRecord:
     """
     Trigger AI exploration for a task.
-    Sprint 2: This will invoke GeminiEngine.run_exploration().
+    Invokes GeminiEngine.run_exploration() with Gemini 2.0 Flash and GitHub tools.
     """
     task = db.get_task(task_id)
     if not task:
@@ -106,16 +107,24 @@ async def run_task(
         )
 
     # Update status to exploring
-    updated = db.update_task_status(task_id, TaskStatus.EXPLORING)
+    db.update_task_status(task_id, TaskStatus.EXPLORING)
+    task = db.get_task(task_id) or task
 
-    # TODO (Sprint 2): Initialize GeminiEngine and run exploration
-    # github = GitHubAdapter(settings.github_personal_access_token, task.repo_full_name)
-    # engine = GeminiEngine(settings.google_generative_ai_api_key, github)
-    # patch_set = await engine.run_exploration(task)
-    # db.save_patches(patch_set.actions, task_id)
-    # updated = db.update_task_status(task_id, TaskStatus.PATCH_READY)
-
-    return updated
+    try:
+        github = GitHubAdapter(settings.github_personal_access_token, task.repo_full_name)
+        engine = GeminiEngine(settings.google_generative_ai_api_key, github)
+        patch_set = await engine.run_exploration(task, db=db)
+        db.save_patches(patch_set.actions, task_id)
+        updated = db.update_task_status(task_id, TaskStatus.PATCH_READY)
+        logger.info("API: Task id=%s exploration completed, status set to patch_ready", task_id)
+        return updated or task
+    except Exception as err:
+        logger.error("API: Exploration failed for task id=%s: %s", task_id, err, exc_info=True)
+        db.update_task_status(task_id, TaskStatus.PENDING)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Autonomous AI exploration failed: {err}",
+        )
 
 
 @router.post("/{task_id}/approve", response_model=ApproveResponse)
