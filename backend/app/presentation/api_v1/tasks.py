@@ -16,6 +16,7 @@ from app.config import Settings, get_settings
 from app.domain.patch import PatchRecord
 from app.domain.task import TaskCreate, TaskRecord, TaskStatus
 from app.domain.task_log import TaskLogEntry
+from app.infrastructure.ai.gemini_engine import GeminiEngine
 from app.infrastructure.database.supabase_client import SupabaseClient
 from app.infrastructure.github.adapter import GitHubAdapter
 
@@ -85,6 +86,16 @@ def get_task(
     return TaskDetailResponse(task=task, patches=patches)
 
 
+from app.use_cases.patch_generator import (
+    PatchGeneratorUseCase,
+    TaskNotFoundError,
+    InvalidTaskStatusError,
+    ExplorationExecutionError,
+)
+
+patch_generator_use_case = PatchGeneratorUseCase()
+
+
 @router.post("/{task_id}/run", response_model=TaskRecord)
 async def run_task(
     task_id: str,
@@ -92,30 +103,26 @@ async def run_task(
     settings: Settings = Depends(get_settings),
 ) -> TaskRecord:
     """
-    Trigger AI exploration for a task.
-    Sprint 2: This will invoke GeminiEngine.run_exploration().
+    Trigger AI exploration for a task via PatchGeneratorUseCase.
+    Coordinates Supabase, Gemini 2.0 Flash engine, GitHub tools, and audit logs.
     """
-    task = db.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
-
-    if task.status != TaskStatus.PENDING:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Task must be in 'pending' status to run. Current: '{task.status.value}'",
+    try:
+        updated_task, _ = await patch_generator_use_case.execute(
+            task_id=task_id,
+            db=db,
+            settings=settings,
         )
+        return updated_task
+    except TaskNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidTaskStatusError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ExplorationExecutionError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error("API: Unexpected error in run_task for task id=%s: %s", task_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
-    # Update status to exploring
-    updated = db.update_task_status(task_id, TaskStatus.EXPLORING)
-
-    # TODO (Sprint 2): Initialize GeminiEngine and run exploration
-    # github = GitHubAdapter(settings.github_personal_access_token, task.repo_full_name)
-    # engine = GeminiEngine(settings.google_generative_ai_api_key, github)
-    # patch_set = await engine.run_exploration(task)
-    # db.save_patches(patch_set.actions, task_id)
-    # updated = db.update_task_status(task_id, TaskStatus.PATCH_READY)
-
-    return updated
 
 
 @router.post("/{task_id}/approve", response_model=ApproveResponse)

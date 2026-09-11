@@ -1,111 +1,441 @@
 from __future__ import annotations
 
 """
-Gemini AI Engine (Skeleton).
+Gemini AI Engine.
 
-This module will house the autonomous agentic loop that uses
-Google Gemini 2.0 Flash with function-calling to explore a GitHub
-repository and produce structured PatchSets.
-
-Full implementation is planned for Sprint 2.
+Autonomous agentic loop powered by Google Gemini 2.0 Flash (temperature: 0).
+Uses function-calling with GitHubAdapter tools (list_directory, read_file, search_code)
+to explore a repository and generate structured PatchSets conforming to PatchProposal schema.
+Includes local verification (search_block exact match) and self-repair retry loop.
+Enforces a 5-round exploration guardrail and 2-attempt self-repair limit.
 """
 
+import json
 import logging
+import re
+from datetime import datetime, timezone
+from typing import Any
 
-from app.domain.patch import PatchSet
+# pyrefly: ignore [missing-import]
+from google import genai
+# pyrefly: ignore [missing-import]
+from google.genai import types
+
+from app.domain.patch import PatchAction, PatchProposal, PatchSet
 from app.domain.task import TaskRecord
+from app.domain.task_log import TaskLogEntry
+from app.infrastructure.database.supabase_client import SupabaseClient
 from app.infrastructure.github.adapter import GitHubAdapter
 
 logger = logging.getLogger(__name__)
+
+SYSTEM_INSTRUCTION = """You are an elite Autonomous Software Maintenance AI Engineer.
+Your mission is to investigate an issue or task in a GitHub repository, identify the root cause, and propose a precise search-and-replace patch.
+
+You have access to 3 tools to explore the codebase:
+1. list_directory(path: str): List files and folders at a directory path (use "" for root).
+2. read_file(file_path: str): Read the full content of a text file (guardrail limit ≤ 100KB).
+3. search_code(query: str): Search for code occurrences or symbols across the repository.
+
+Operational Guidelines:
+- Explore efficiently. Start by searching or listing the relevant directory.
+- Read only the files necessary to diagnose the issue and design the fix.
+- Do NOT guess file paths or contents without inspecting them with tools first.
+- When you have enough context and have formulated the exact fix, STOP calling tools and output your final response.
+
+Final Response Format:
+Your final response MUST be a valid JSON object matching this schema (do NOT include extraneous conversation outside or inside the JSON block):
+```json
+{
+  "summary": "Brief, clear explanation of the root cause and the changes made.",
+  "actions": [
+    {
+      "file_path": "path/to/target/file.py",
+      "search_block": "exact lines of code in the target file to be replaced",
+      "replace_block": "new replacement lines of code",
+      "explanation": "Why this specific change was made."
+    }
+  ]
+}
+```
+
+Important Rules for search_block:
+- search_block must match the exact indentation, whitespace, and lines currently in the file.
+- Keep search_block concise and uniquely identifiable.
+"""
 
 
 class GeminiEngine:
     """
     Autonomous AI agent powered by Gemini 2.0 Flash.
 
-    Uses function-calling with three tools (readFile, listDirectory,
-    searchCode) to explore a GitHub repository and generate structured
-    patch proposals.
-
     Configuration:
-        - temperature: 0 (deterministic output)
         - model: gemini-2.0-flash
+        - temperature: 0 (deterministic output)
+        - max_tool_rounds: 5 (guardrail against infinite loops)
+        - max_repair_attempts: 2 (self-repair retry limit on verification failure)
     """
 
-    def __init__(self, api_key: str, github_adapter: GitHubAdapter) -> None:
+    MODEL_NAME = "gemini-2.0-flash"
+    TEMPERATURE = 0.0
+    MAX_TOOL_ROUNDS = 5
+    MAX_REPAIR_ATTEMPTS = 2
+
+    def __init__(
+        self,
+        api_key: str,
+        github_adapter: GitHubAdapter,
+        client: genai.Client | None = None,
+    ) -> None:
         self._api_key = api_key
         self._github = github_adapter
+        self._client = client or genai.Client(api_key=api_key)
         logger.info(
-            "GeminiEngine initialized for repo '%s' (Sprint 2 skeleton)",
+            "GeminiEngine initialized for repo '%s' with model '%s' (temp=%s, max_rounds=%d, max_repairs=%d)",
             github_adapter.repo_full_name,
+            self.MODEL_NAME,
+            self.TEMPERATURE,
+            self.MAX_TOOL_ROUNDS,
+            self.MAX_REPAIR_ATTEMPTS,
         )
 
-    def _build_tools(self) -> list[dict]:
+    def _get_tools(self) -> list[Any]:
         """
-        Build the tool/function declarations for Gemini function-calling.
+        Define the callable tools for Gemini function-calling.
+        """
 
-        Defines three tools:
-          - listDirectory(path: str) → list files/dirs
-          - readFile(file_path: str) → read file content (≤100KB)
-          - searchCode(query: str)   → search code in repo
+        def list_directory(path: str = "") -> list[dict]:
+            """
+            List files and directories at the given path in the repository.
+            Args:
+                path: Directory path relative to repository root. Use empty string '' for root.
+            """
+            return self._github.list_directory(path=path)
+
+        def read_file(file_path: str) -> dict:
+            """
+            Read the contents of a file from the repository (max 100KB).
+            Args:
+                file_path: Relative path to the file within the repository.
+            """
+            return self._github.read_file(file_path=file_path)
+
+        def search_code(query: str) -> list[dict]:
+            """
+            Search for code matching a query within the repository.
+            Args:
+                query: Search query string (e.g. function name, class name, error message).
+            """
+            return self._github.search_code(query=query)
+
+        return [list_directory, read_file, search_code]
+
+    def _execute_tool(self, name: str, args: dict[str, Any]) -> Any:
+        """Execute a tool call against the GitHub adapter with normalized tool names."""
+        normalized = name.lower().replace("_", "")
+        if normalized == "listdirectory":
+            path = args.get("path", "")
+            return self._github.list_directory(path=path)
+        elif normalized == "readfile":
+            file_path = args.get("file_path", "") or args.get("filePath", "")
+            return self._github.read_file(file_path=file_path)
+        elif normalized == "searchcode":
+            query = args.get("query", "")
+            return self._github.search_code(query=query)
+        else:
+            logger.warning("Unrecognized tool name called: %s", name)
+            return {"error": f"Unknown tool: '{name}'"}
+
+    def _extract_patch_set(self, response_text: str, task_id: str) -> PatchSet:
         """
-        return [
-            {
-                "name": "listDirectory",
-                "description": "List files and directories at a given path in the repository.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Directory path relative to repo root. Use '' for root.",
-                        }
-                    },
-                    "required": ["path"],
-                },
-            },
-            {
-                "name": "readFile",
-                "description": "Read the contents of a file. Max 100KB.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "File path relative to repo root.",
-                        }
-                    },
-                    "required": ["file_path"],
-                },
-            },
-            {
-                "name": "searchCode",
-                "description": "Search for code matching a query in the repository.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query string.",
-                        }
-                    },
-                    "required": ["query"],
-                },
-            },
+        Extract and parse a structured PatchSet from Gemini's response text.
+        Handles markdown code blocks and raw JSON strings.
+        """
+        text = response_text.strip()
+
+        # Attempt to extract JSON from markdown code fence
+        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+        if json_match:
+            raw_json = json_match.group(1).strip()
+        else:
+            # Fallback to looking for matching outermost curly braces
+            brace_match = re.search(r"(\{[\s\S]*\})", text)
+            raw_json = brace_match.group(1).strip() if brace_match else text
+
+        try:
+            data = json.loads(raw_json)
+        except json.JSONDecodeError as err:
+            logger.error("Failed to parse PatchSet JSON from model output: %s\nOutput:\n%s", err, text)
+            raise ValueError(f"AI response is not valid JSON: {err}") from err
+
+        summary = data.get("summary", "Automated AI patch")
+        actions_raw = data.get("actions", [])
+
+        if not isinstance(actions_raw, list) or len(actions_raw) == 0:
+            raise ValueError("AI response does not contain any patch actions.")
+
+        actions = [
+            PatchProposal(
+                file_path=a.get("file_path", ""),
+                search_block=a.get("search_block", ""),
+                replace_block=a.get("replace_block", ""),
+                explanation=a.get("explanation", ""),
+            )
+            for a in actions_raw
         ]
 
-    async def run_exploration(self, task: TaskRecord) -> PatchSet:
+        return PatchSet(
+            task_id=task_id,
+            summary=summary,
+            actions=actions,
+        )
+
+    def verify_patch_locally(self, patch_set: PatchSet) -> tuple[bool, str | None]:
+        """
+        Verify that all proposed patch actions are valid against the actual repository files.
+        Checks:
+        1. Target file exists and can be read.
+        2. action.search_block exactly exists in the file content.
+        """
+        for action in patch_set.actions:
+            try:
+                file_data = self._github.read_file(file_path=action.file_path)
+                content = file_data.get("content", "")
+            except Exception as e:
+                return False, f"File '{action.file_path}' could not be read or does not exist: {e}"
+
+            if not action.search_block:
+                return False, f"search_block in '{action.file_path}' is empty."
+
+            if action.search_block not in content:
+                return False, (
+                    f"search_block was not found in file '{action.file_path}'. "
+                    f"Ensure exact indentation and line breaks matching the original file."
+                )
+
+        return True, None
+
+    async def _resolve_and_verify_patch_set(
+        self,
+        response_text: str,
+        task: TaskRecord,
+        contents: list[types.Content],
+    ) -> PatchSet:
+        """
+        Extracts PatchSet, verifies locally, and triggers self-repair retries if verification fails.
+        """
+        current_text = response_text
+        repair_attempt = 0
+
+        while True:
+            error_message: str | None = None
+            candidate_patch_set: PatchSet | None = None
+
+            try:
+                candidate_patch_set = self._extract_patch_set(current_text, task.id)
+                is_valid, verify_err = self.verify_patch_locally(candidate_patch_set)
+                if not is_valid:
+                    error_message = verify_err
+            except Exception as parse_err:
+                error_message = f"Invalid PatchSet format: {parse_err}"
+
+            # If valid and verified, return immediately
+            if candidate_patch_set is not None and error_message is None:
+                logger.info("Task id=%s | PatchSet successfully verified locally.", task.id)
+                return candidate_patch_set
+
+            # If validation failed and we still have repair attempts remaining:
+            if repair_attempt < self.MAX_REPAIR_ATTEMPTS:
+                repair_attempt += 1
+                logger.warning(
+                    "Task id=%s | Patch verification failed: %s. Initiating self-repair attempt %d/%d.",
+                    task.id,
+                    error_message,
+                    repair_attempt,
+                    self.MAX_REPAIR_ATTEMPTS,
+                )
+
+                repair_prompt = (
+                    f"Your proposed patch failed local verification with the following error:\n"
+                    f"{error_message}\n\n"
+                    f"Please review the error, inspect the target file if needed, and output a corrected, "
+                    f"valid PatchSet JSON conforming strictly to the PatchProposal schema."
+                )
+
+                contents.append(
+                    types.Content(role="user", parts=[types.Part.from_text(text=repair_prompt)])
+                )
+
+                repair_config = types.GenerateContentConfig(
+                    temperature=self.TEMPERATURE,
+                    system_instruction=SYSTEM_INSTRUCTION,
+                )
+
+                repair_response = self._client.models.generate_content(
+                    model=self.MODEL_NAME,
+                    contents=contents,
+                    config=repair_config,
+                )
+
+                if repair_response.candidates and repair_response.candidates[0].content:
+                    contents.append(repair_response.candidates[0].content)
+
+                current_text = repair_response.text or ""
+            else:
+                logger.error(
+                    "Task id=%s | Max self-repair attempts (%d) reached. Last error: %s",
+                    task.id,
+                    self.MAX_REPAIR_ATTEMPTS,
+                    error_message,
+                )
+                if candidate_patch_set is not None:
+                    raise ValueError(
+                        f"PatchSet failed local verification after {self.MAX_REPAIR_ATTEMPTS} repair attempts: {error_message}"
+                    )
+                raise ValueError(
+                    f"Failed to parse valid PatchSet JSON after {self.MAX_REPAIR_ATTEMPTS} repair attempts: {error_message}"
+                )
+
+    async def run_exploration(
+        self,
+        task: TaskRecord,
+        db: SupabaseClient | None = None,
+    ) -> PatchSet:
         """
         Execute the autonomous agentic loop:
-        1. Send task description + tool definitions to Gemini
-        2. Loop: receive tool calls → execute via GitHubAdapter → return results
-        3. Continue until Gemini produces a structured PatchSet
-        4. Validate and return the PatchSet
-
-        Raises NotImplementedError — full implementation in Sprint 2.
+        1. Send task description + tools to Gemini 2.0 Flash (temp: 0).
+        2. Loop: if Gemini requests tool call -> execute tool -> return output -> repeat.
+        3. Enforce 5-round guardrail.
+        4. When Gemini finishes, parse and locally verify structured PatchSet (with self-repair retry).
         """
-        raise NotImplementedError(
-            "GeminiEngine.run_exploration() is a Sprint 2 deliverable. "
-            "The agentic loop with Gemini function-calling will be "
-            "implemented after the foundation layer is verified."
+        logger.info(
+            "Starting autonomous exploration for task id=%s title='%s'",
+            task.id,
+            task.title,
         )
+
+        config = types.GenerateContentConfig(
+            temperature=self.TEMPERATURE,
+            system_instruction=SYSTEM_INSTRUCTION,
+            tools=self._get_tools(),
+        )
+
+        user_prompt = (
+            f"Repository: {task.repo_full_name}\n"
+            f"Task Title: {task.title}\n"
+            f"Task Description:\n{task.description}\n\n"
+            "Please explore the repository to locate the issue, verify the relevant code, "
+            "and output the final PatchSet JSON."
+        )
+
+        contents: list[types.Content] = [
+            types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])
+        ]
+
+        step_counter = 0
+        round_counter = 0
+
+        while round_counter < self.MAX_TOOL_ROUNDS:
+            round_counter += 1
+            logger.info(
+                "Task id=%s | Turn round %d/%d calling Gemini model...",
+                task.id,
+                round_counter,
+                self.MAX_TOOL_ROUNDS,
+            )
+
+            # Call Gemini
+            response = self._client.models.generate_content(
+                model=self.MODEL_NAME,
+                contents=contents,
+                config=config,
+            )
+
+            # Validate response candidate
+            if not response.candidates or not response.candidates[0].content:
+                raise RuntimeError("Empty response received from Gemini model.")
+
+            candidate_content = response.candidates[0].content
+            contents.append(candidate_content)
+
+            # Check if Gemini triggered any function calls
+            function_calls = response.function_calls
+            if not function_calls:
+                # No function calls -> Model produced final response
+                logger.info("Task id=%s | Model produced final response in round %d.", task.id, round_counter)
+                response_text = response.text or ""
+                return await self._resolve_and_verify_patch_set(response_text, task, contents)
+
+            # Execute tool calls and build function responses
+            tool_response_parts: list[types.Part] = []
+            for fc in function_calls:
+                step_counter += 1
+                tool_name = fc.name
+                tool_args = fc.args or {}
+
+                logger.info(
+                    "Task id=%s | Step %d: executing tool '%s' with args %s",
+                    task.id,
+                    step_counter,
+                    tool_name,
+                    tool_args,
+                )
+
+                tool_result = self._execute_tool(tool_name, tool_args)
+
+                # Record audit log in database if available
+                if db:
+                    try:
+                        log_entry = TaskLogEntry(
+                            task_id=task.id,
+                            step_number=step_counter,
+                            tool_name=tool_name,
+                            tool_input=tool_args,
+                            tool_output=json.dumps(tool_result)[:4000],
+                            created_at=datetime.now(timezone.utc),
+                        )
+                        db.append_log(log_entry)
+                    except Exception as log_err:
+                        logger.warning("Failed to record task audit log: %s", log_err)
+
+                tool_response_parts.append(
+                    types.Part.from_function_response(
+                        name=tool_name,
+                        response={"result": tool_result},
+                    )
+                )
+
+            # Append tool outputs back to conversation
+            contents.append(types.Content(role="user", parts=tool_response_parts))
+
+        # If guardrail reached (5 rounds) and still calling tools, request immediate synthesis
+        logger.warning(
+            "Task id=%s reached max tool rounds (%d). Requesting immediate final synthesis.",
+            task.id,
+            self.MAX_TOOL_ROUNDS,
+        )
+
+        final_prompt = (
+            "You have reached the maximum allowed tool exploration rounds (5). "
+            "Based strictly on the information gathered so far, provide your final PatchSet JSON immediately."
+        )
+        contents.append(
+            types.Content(role="user", parts=[types.Part.from_text(text=final_prompt)])
+        )
+
+        # Call model with temperature 0 to finalize without further tools
+        final_config = types.GenerateContentConfig(
+            temperature=self.TEMPERATURE,
+            system_instruction=SYSTEM_INSTRUCTION,
+        )
+        final_response = self._client.models.generate_content(
+            model=self.MODEL_NAME,
+            contents=contents,
+            config=final_config,
+        )
+
+        if final_response.candidates and final_response.candidates[0].content:
+            contents.append(final_response.candidates[0].content)
+
+        response_text = final_response.text or ""
+        return await self._resolve_and_verify_patch_set(response_text, task, contents)
