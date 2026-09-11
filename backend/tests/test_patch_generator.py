@@ -88,7 +88,7 @@ class TestPatchGeneratorUseCase(unittest.IsolatedAsyncioTestCase):
         self.mock_db.save_patches.assert_called_once_with(self.mock_patch_set.actions, "task-uuid-1234")
 
         # Verify engine was invoked with task (status=EXPLORING) and db for audit logging
-        mock_engine.run_exploration.assert_called_once_with(self.exploring_task, db=self.mock_db)
+        mock_engine.run_exploration.assert_called_once_with(self.exploring_task, db=self.mock_db, language="en")
 
     async def test_execute_task_not_found(self):
         self.mock_db.get_task.return_value = None

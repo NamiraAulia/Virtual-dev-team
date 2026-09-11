@@ -77,6 +77,7 @@ class GeminiEngine:
     """
 
     MODEL_NAME = "gemini-2.0-flash"
+    FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-flash-latest"]
     TEMPERATURE = 0.0
     MAX_TOOL_ROUNDS = 5
     MAX_REPAIR_ATTEMPTS = 2
@@ -86,18 +87,58 @@ class GeminiEngine:
         api_key: str,
         github_adapter: GitHubAdapter,
         client: genai.Client | None = None,
+        model_name: str | None = None,
     ) -> None:
         self._api_key = api_key
         self._github = github_adapter
         self._client = client or genai.Client(api_key=api_key)
+        self.model_name = model_name or self.MODEL_NAME
         logger.info(
             "GeminiEngine initialized for repo '%s' with model '%s' (temp=%s, max_rounds=%d, max_repairs=%d)",
             github_adapter.repo_full_name,
-            self.MODEL_NAME,
+            self.model_name,
             self.TEMPERATURE,
             self.MAX_TOOL_ROUNDS,
             self.MAX_REPAIR_ATTEMPTS,
         )
+
+    def _generate_content_with_fallback(
+        self,
+        contents: list[types.Content],
+        config: types.GenerateContentConfig,
+    ) -> types.GenerateContentResponse:
+        """
+        Calls generate_content using the configured model. If a rate limit (429),
+        quota exhaustion, or service unavailability occurs, automatically tries
+        fallback models.
+        """
+        models_to_try = [self.model_name] + [m for m in self.FALLBACK_MODELS if m != self.model_name]
+        last_error = None
+
+        for model_candidate in models_to_try:
+            try:
+                response = self._client.models.generate_content(
+                    model=model_candidate,
+                    contents=contents,
+                    config=config,
+                )
+                if model_candidate != self.model_name:
+                    logger.info("Successfully completed request using fallback model '%s'", model_candidate)
+                    self.model_name = model_candidate
+                return response
+            except Exception as e:
+                err_str = str(e)
+                if any(x in err_str for x in ["429", "RESOURCE_EXHAUSTED", "Quota exceeded", "503", "404", "NOT_FOUND"]):
+                    logger.warning(
+                        "Model '%s' failed with error (%s). Trying fallback candidate...",
+                        model_candidate,
+                        err_str[:200],
+                    )
+                    last_error = e
+                    continue
+                raise
+
+        raise last_error or RuntimeError("All model candidates failed.")
 
     def _get_tools(self) -> list[Any]:
         """
@@ -195,7 +236,7 @@ class GeminiEngine:
         Verify that all proposed patch actions are valid against the actual repository files.
         Checks:
         1. Target file exists and can be read.
-        2. action.search_block exactly exists in the file content.
+        2. action.search_block exactly exists in the file content (normalized LF line endings).
         """
         for action in patch_set.actions:
             try:
@@ -204,16 +245,38 @@ class GeminiEngine:
             except Exception as e:
                 return False, f"File '{action.file_path}' could not be read or does not exist: {e}"
 
-            if not action.search_block:
+            if not action.search_block or not action.search_block.strip():
                 return False, f"search_block in '{action.file_path}' is empty."
 
-            if action.search_block not in content:
+            # Normalize line endings for reliable matching across platforms
+            norm_content = content.replace("\r\n", "\n")
+            norm_search = action.search_block.replace("\r\n", "\n")
+
+            if norm_search not in norm_content and norm_search.strip() not in norm_content:
+                # Provide actual snippet to assist automated self-repair
+                snippet = norm_content[:2500]
                 return False, (
                     f"search_block was not found in file '{action.file_path}'. "
+                    f"Here is the actual file content to copy from:\n```\n{snippet}\n```\n"
                     f"Ensure exact indentation and line breaks matching the original file."
                 )
 
         return True, None
+
+
+    def _extract_response_text(self, response: types.GenerateContentResponse) -> str:
+        """Safely extract plain text from Gemini response, including multi-part candidates."""
+        if response.text and response.text.strip():
+            return response.text.strip()
+
+        if response.candidates and len(response.candidates) > 0:
+            content = response.candidates[0].content
+            if content and content.parts:
+                parts_text = [p.text for p in content.parts if p.text and p.text.strip()]
+                if parts_text:
+                    return "\n".join(parts_text).strip()
+
+        return ""
 
     async def _resolve_and_verify_patch_set(
         self,
@@ -231,13 +294,16 @@ class GeminiEngine:
             error_message: str | None = None
             candidate_patch_set: PatchSet | None = None
 
-            try:
-                candidate_patch_set = self._extract_patch_set(current_text, task.id)
-                is_valid, verify_err = self.verify_patch_locally(candidate_patch_set)
-                if not is_valid:
-                    error_message = verify_err
-            except Exception as parse_err:
-                error_message = f"Invalid PatchSet format: {parse_err}"
+            if not current_text or not current_text.strip():
+                error_message = "AI response text was empty or did not contain JSON."
+            else:
+                try:
+                    candidate_patch_set = self._extract_patch_set(current_text, task.id)
+                    is_valid, verify_err = self.verify_patch_locally(candidate_patch_set)
+                    if not is_valid:
+                        error_message = verify_err
+                except Exception as parse_err:
+                    error_message = f"Invalid PatchSet format: {parse_err}"
 
             # If valid and verified, return immediately
             if candidate_patch_set is not None and error_message is None:
@@ -271,16 +337,15 @@ class GeminiEngine:
                     system_instruction=SYSTEM_INSTRUCTION,
                 )
 
-                repair_response = self._client.models.generate_content(
-                    model=self.MODEL_NAME,
+                repair_response = self._generate_content_with_fallback(
                     contents=contents,
                     config=repair_config,
                 )
 
-                if repair_response.candidates and repair_response.candidates[0].content:
+                if repair_response.candidates and len(repair_response.candidates) > 0 and repair_response.candidates[0].content:
                     contents.append(repair_response.candidates[0].content)
 
-                current_text = repair_response.text or ""
+                current_text = self._extract_response_text(repair_response)
             else:
                 logger.error(
                     "Task id=%s | Max self-repair attempts (%d) reached. Last error: %s",
@@ -300,6 +365,7 @@ class GeminiEngine:
         self,
         task: TaskRecord,
         db: SupabaseClient | None = None,
+        language: str = "en",
     ) -> PatchSet:
         """
         Execute the autonomous agentic loop:
@@ -309,24 +375,42 @@ class GeminiEngine:
         4. When Gemini finishes, parse and locally verify structured PatchSet (with self-repair retry).
         """
         logger.info(
-            "Starting autonomous exploration for task id=%s title='%s'",
+            "Starting autonomous exploration for task id=%s title='%s' (language=%s)",
             task.id,
             task.title,
+            language,
         )
+
+        sys_inst = SYSTEM_INSTRUCTION
+        if language == "id":
+            sys_inst += (
+                "\n\nLanguage Directive:\n"
+                "You MUST write the 'summary' and each action's 'explanation' field in professional Bahasa Indonesia. "
+                "The JSON schema keys, file paths, search_block, and replace_block must remain exact code and must NOT be translated."
+            )
 
         config = types.GenerateContentConfig(
             temperature=self.TEMPERATURE,
-            system_instruction=SYSTEM_INSTRUCTION,
+            system_instruction=sys_inst,
             tools=self._get_tools(),
         )
 
-        user_prompt = (
-            f"Repository: {task.repo_full_name}\n"
-            f"Task Title: {task.title}\n"
-            f"Task Description:\n{task.description}\n\n"
-            "Please explore the repository to locate the issue, verify the relevant code, "
-            "and output the final PatchSet JSON."
-        )
+        if language == "id":
+            user_prompt = (
+                f"Repository: {task.repo_full_name}\n"
+                f"Judul Tugas: {task.title}\n"
+                f"Deskripsi Tugas:\n{task.description}\n\n"
+                "Silakan telusuri repositori untuk mengidentifikasi masalah, verifikasi kode yang relevan, "
+                "dan hasilkan JSON PatchSet final dengan ringkasan (summary) dan penjelasan (explanation) dalam Bahasa Indonesia."
+            )
+        else:
+            user_prompt = (
+                f"Repository: {task.repo_full_name}\n"
+                f"Task Title: {task.title}\n"
+                f"Task Description:\n{task.description}\n\n"
+                "Please explore the repository to locate the issue, verify the relevant code, "
+                "and output the final PatchSet JSON."
+            )
 
         contents: list[types.Content] = [
             types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])
@@ -345,15 +429,14 @@ class GeminiEngine:
             )
 
             # Call Gemini
-            response = self._client.models.generate_content(
-                model=self.MODEL_NAME,
+            response = self._generate_content_with_fallback(
                 contents=contents,
                 config=config,
             )
 
             # Validate response candidate
-            if not response.candidates or not response.candidates[0].content:
-                raise RuntimeError("Empty response received from Gemini model.")
+            if not response.candidates or len(response.candidates) == 0 or not response.candidates[0].content:
+                raise RuntimeError("Empty or candidate-less response received from Gemini model.")
 
             candidate_content = response.candidates[0].content
             contents.append(candidate_content)
@@ -363,7 +446,7 @@ class GeminiEngine:
             if not function_calls:
                 # No function calls -> Model produced final response
                 logger.info("Task id=%s | Model produced final response in round %d.", task.id, round_counter)
-                response_text = response.text or ""
+                response_text = self._extract_response_text(response)
                 return await self._resolve_and_verify_patch_set(response_text, task, contents)
 
             # Execute tool calls and build function responses
@@ -428,8 +511,7 @@ class GeminiEngine:
             temperature=self.TEMPERATURE,
             system_instruction=SYSTEM_INSTRUCTION,
         )
-        final_response = self._client.models.generate_content(
-            model=self.MODEL_NAME,
+        final_response = self._generate_content_with_fallback(
             contents=contents,
             config=final_config,
         )
@@ -437,5 +519,5 @@ class GeminiEngine:
         if final_response.candidates and final_response.candidates[0].content:
             contents.append(final_response.candidates[0].content)
 
-        response_text = final_response.text or ""
+        response_text = self._extract_response_text(final_response)
         return await self._resolve_and_verify_patch_set(response_text, task, contents)
