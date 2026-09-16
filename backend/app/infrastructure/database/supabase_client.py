@@ -40,6 +40,9 @@ class SupabaseClient:
             "updated_at": now,
         }
         result = self._client.table("tasks").insert(data).execute()
+        if not result.data or len(result.data) == 0:
+            logger.error("Supabase create_task failed to return created row data")
+            raise RuntimeError("Database insertion failed: empty record returned from Supabase")
         row = result.data[0]
         logger.info("Created task id=%s title='%s'", row["id"], row["title"])
         return TaskRecord(**row)
@@ -52,7 +55,7 @@ class SupabaseClient:
             .eq("id", task_id)
             .execute()
         )
-        if not result.data:
+        if not result.data or len(result.data) == 0:
             return None
         return TaskRecord(**result.data[0])
 
@@ -64,7 +67,7 @@ class SupabaseClient:
             .order("created_at", desc=True)
             .execute()
         )
-        return [TaskRecord(**row) for row in result.data]
+        return [TaskRecord(**row) for row in (result.data or [])]
 
     def update_task_status(self, task_id: str, status: TaskStatus) -> TaskRecord | None:
         """Update a task's status and return the updated record."""
@@ -75,8 +78,9 @@ class SupabaseClient:
             .eq("id", task_id)
             .execute()
         )
-        if not result.data:
-            return None
+        if not result.data or len(result.data) == 0:
+            logger.warning("update_task_status for task_id=%s returned empty data", task_id)
+            return self.get_task(task_id)
         logger.info("Updated task id=%s status=%s", task_id, status.value)
         return TaskRecord(**result.data[0])
 

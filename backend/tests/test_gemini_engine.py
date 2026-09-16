@@ -29,6 +29,7 @@ class TestGeminiEngine(unittest.IsolatedAsyncioTestCase):
         self.mock_github.search_code.return_value = [
             {"name": "main.py", "path": "main.py", "html_url": "https://github.com/test-owner/test-repo/blob/main/main.py"}
         ]
+        self.mock_github.prefetch_relevant_files.return_value = {}
 
         self.sample_task = TaskRecord(
             id="123e4567-e89b-12d3-a456-426614174000",
@@ -42,7 +43,7 @@ class TestGeminiEngine(unittest.IsolatedAsyncioTestCase):
 
     def test_gemini_engine_initialization(self):
         engine = GeminiEngine(api_key="dummy-key", github_adapter=self.mock_github)
-        self.assertEqual(engine.MODEL_NAME, "gemini-2.0-flash")
+        self.assertEqual(engine.MODEL_NAME, "gemini-flash-latest")
         self.assertEqual(engine.TEMPERATURE, 0.0)
         self.assertEqual(engine.MAX_TOOL_ROUNDS, 5)
         self.assertEqual(engine.MAX_REPAIR_ATTEMPTS, 2)
@@ -278,6 +279,37 @@ class TestGeminiEngine(unittest.IsolatedAsyncioTestCase):
         # Verify exactly 6 generate_content calls (5 exploration turns + 1 final forced turn)
         self.assertEqual(mock_client.models.generate_content.call_count, 6)
 
+    async def test_prefetch_accelerates_exploration(self):
+        self.mock_github.prefetch_relevant_files.return_value = {
+            "app/main.py": "def run():\n    print('error')"
+        }
+
+        mock_client = MagicMock()
+        final_json = json.dumps({
+            "summary": "Instant 1-round patch using pre-fetched context",
+            "actions": [
+                {
+                    "file_path": "main.py",
+                    "search_block": "print('error')",
+                    "replace_block": "print('fixed')",
+                    "explanation": "Fixed instantly with prefetch context",
+                }
+            ]
+        })
+        final_resp = MagicMock()
+        final_resp.candidates = [MagicMock(content=types.Content(role="model", parts=[types.Part.from_text(text=final_json)]))]
+        final_resp.function_calls = None
+        final_resp.text = final_json
+        mock_client.models.generate_content.return_value = final_resp
+
+        engine = GeminiEngine(api_key="dummy-key", github_adapter=self.mock_github, client=mock_client)
+        patch_set = await engine.run_exploration(self.sample_task)
+
+        self.mock_github.prefetch_relevant_files.assert_called_once()
+        self.assertEqual(patch_set.summary, "Instant 1-round patch using pre-fetched context")
+        self.assertEqual(mock_client.models.generate_content.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+

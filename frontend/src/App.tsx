@@ -1,122 +1,430 @@
-import { useState } from 'react'
-import heroImg from './assets/hero.png'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import './App.css'
+import { useState, useEffect } from 'react';
+import {
+  QueryClient,
+  QueryClientProvider,
+  useQuery,
+  useMutation,
+  useQueryClient,
+} from '@tanstack/react-query';
+import {
+  GitPullRequest,
+  ExternalLink,
+  Plus,
+} from 'lucide-react';
+import axios from 'axios';
+import { api } from './api/client';
+import type { TaskCreateInput, Task, TaskLogEntry, TaskDetail } from './types';
+import { Sidebar } from './components/Sidebar';
+import { Header } from './components/Header';
+import { PipelineStages } from './components/PipelineStages';
+import { LiveTurnBanner } from './components/LiveTurnBanner';
+import { RCAPanel } from './components/RCAPanel';
+import { DiffViewer } from './components/DiffViewer';
+import { ActionControls } from './components/ActionControls';
+import { TaskModal } from './components/TaskModal';
+import { TaskList } from './components/TaskList';
+import { LiveActivityFeed } from './components/LiveActivityFeed';
+import { SentryModal } from './components/SentryModal';
+import { LanguageProvider, useLanguage } from './context/LanguageContext';
 
-function App() {
-  const [count, setCount] = useState(0)
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: 1,
+      refetchOnWindowFocus: false,
+    },
+  },
+});
+
+function DashboardContent() {
+  const qc = useQueryClient();
+  const { language, t } = useLanguage();
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [selectedModel, setSelectedModelState] = useState<string>(() => {
+    return localStorage.getItem('patchops_ai_model') || 'gemini-flash-latest';
+  });
+
+  const setSelectedModel = (modelId: string) => {
+    setSelectedModelState(modelId);
+    try {
+      localStorage.setItem('patchops_ai_model', modelId);
+    } catch {
+      // Ignore localStorage write error
+    }
+  };
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSentryModalOpen, setIsSentryModalOpen] = useState(false);
+  const [isBackendConnected, setIsBackendConnected] = useState(true);
+  const [currentTab, setCurrentTab] = useState<'dashboard' | 'logs' | 'prs'>('dashboard');
+
+  const { data: tasks = [], isLoading: isTasksLoading } = useQuery<Task[]>({
+    queryKey: ['tasks'],
+    queryFn: api.getTasks,
+  });
+
+  const effectiveTaskId = selectedTaskId || (tasks.length > 0 ? tasks[0].id : '');
+
+  // 2. Health check
+  useEffect(() => {
+    const check = async () => {
+      try {
+        await api.checkHealth();
+        setIsBackendConnected(true);
+      } catch {
+        setIsBackendConnected(false);
+      }
+    };
+    check();
+    const interval = setInterval(check, 15000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Keyboard shortcut Ctrl+N / Cmd+N
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
+        e.preventDefault();
+        setIsModalOpen(true);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // 3. Fetch active task detail & patches (no polling needed - handled via SSE)
+  const { data: taskDetail } = useQuery({
+    queryKey: ['task', effectiveTaskId],
+    queryFn: () => (effectiveTaskId ? api.getTask(effectiveTaskId) : null),
+    enabled: !!effectiveTaskId,
+  });
+
+  const activeTask = taskDetail?.task || tasks.find((t) => t.id === effectiveTaskId);
+  const activePatches = taskDetail?.patches || [];
+  const isExploring = activeTask?.status === 'exploring';
+
+  const { data: taskLogs = [], isLoading: isLogsLoading } = useQuery({
+    queryKey: ['task_logs', effectiveTaskId],
+    queryFn: () => (effectiveTaskId ? api.getTaskLogs(effectiveTaskId) : []),
+    enabled: !!effectiveTaskId,
+  });
+
+  // Real-time Server-Sent Events (SSE) Stream
+  useEffect(() => {
+    if (!effectiveTaskId || !isExploring) return;
+
+    const streamUrl = api.getTaskStreamUrl(effectiveTaskId);
+    const eventSource = new EventSource(streamUrl);
+
+    eventSource.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload.type === 'log') {
+          qc.setQueryData<TaskLogEntry[]>(['task_logs', effectiveTaskId], (oldLogs = []) => {
+            const exists = oldLogs.some(
+              (l) =>
+                l.step_number === payload.data.step_number &&
+                l.tool_name === payload.data.tool_name
+            );
+            if (exists) return oldLogs;
+            return [...oldLogs, payload.data];
+          });
+        } else if (
+          payload.type === 'patch_ready' ||
+          payload.type === 'status_changed' ||
+          payload.type === 'exploration_failed'
+        ) {
+          qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
+          qc.invalidateQueries({ queryKey: ['tasks'] });
+          qc.invalidateQueries({ queryKey: ['task_logs', effectiveTaskId] });
+        }
+      } catch {
+        // Ping or non-json message
+      }
+    };
+
+    eventSource.onerror = () => {
+      // EventSource automatically retries on disconnect
+    };
+
+    return () => {
+      eventSource.close();
+    };
+  }, [effectiveTaskId, isExploring, qc]);
+
+  // Mutations
+  const createMutation = useMutation({
+    mutationFn: async ({ data }: { data: TaskCreateInput; autoRun: boolean }) => {
+      return await api.createTask(data);
+    },
+    onSuccess: (newTask, { autoRun }) => {
+      qc.invalidateQueries({ queryKey: ['tasks'] });
+      setSelectedTaskId(newTask.id);
+      if (autoRun) {
+        runMutation.mutate({ taskId: newTask.id, language, model: selectedModel });
+      }
+    },
+  });
+
+  const runMutation = useMutation({
+    mutationFn: ({ taskId, language, model }: { taskId: string; language: string; model: string }) =>
+      api.runTask(taskId, language, model),
+    onMutate: async ({ taskId }) => {
+      qc.setQueryData<TaskDetail | null>(['task', taskId], (old) => {
+        if (!old) return old;
+        return { ...old, task: { ...old.task, status: 'exploring' } };
+      });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['tasks'] });
+      qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
+      qc.invalidateQueries({ queryKey: ['task_logs', effectiveTaskId] });
+    },
+    onError: (err: unknown) => {
+      qc.invalidateQueries({ queryKey: ['tasks'] });
+      qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
+      qc.invalidateQueries({ queryKey: ['task_logs', effectiveTaskId] });
+      let detail = 'Error occurred';
+      if (axios.isAxiosError(err)) {
+        detail = err.response?.data?.detail || err.message;
+      } else if (err instanceof Error) {
+        detail = err.message;
+      }
+      alert(`Autonomous AI Error: ${detail}`);
+    },
+  });
+
+  const resetMutation = useMutation({
+    mutationFn: (taskId: string) => api.resetTask(taskId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['tasks'] });
+      qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
+      qc.invalidateQueries({ queryKey: ['task_logs', effectiveTaskId] });
+    },
+  });
+
+  const approveMutation = useMutation({
+    mutationFn: ({ taskId, comment, language }: { taskId: string; comment?: string; language: string }) =>
+      api.approveTask(taskId, comment, language),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['tasks'] });
+      qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
+    },
+  });
+
+  const rejectMutation = useMutation({
+    mutationFn: ({ taskId, reason }: { taskId: string; reason?: string }) =>
+      api.rejectTask(taskId, reason),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['tasks'] });
+      qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
+    },
+  });
+
+  const activeRepo = activeTask?.repo_full_name.split('/')[1] || activeTask?.repo_full_name || 'payment-gateway';
 
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+    <div className="min-h-screen bg-slate-50 flex text-slate-900">
+      <Sidebar
+        currentTab={currentTab}
+        onTabChange={setCurrentTab}
+        isBackendConnected={isBackendConnected}
+        selectedModel={selectedModel}
+        onModelChange={setSelectedModel}
+      />
 
-      <div className="ticks"></div>
+      <div className="flex-1 flex flex-col min-w-0">
+        <Header
+          onNewTaskClick={() => setIsModalOpen(true)}
+          onSentryClick={() => setIsSentryModalOpen(true)}
+          isBackendConnected={isBackendConnected}
+          activeRepo={activeRepo}
+        />
 
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
+        <main className="flex-1 p-6 space-y-5 overflow-y-auto">
+          <PipelineStages
+            status={activeTask?.status}
+            hasPatches={activePatches.length > 0}
+            hasPr={!!activeTask?.pr_number}
+          />
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
-  )
+          {currentTab === 'dashboard' && (
+            <div className="space-y-5">
+              <LiveTurnBanner
+                status={activeTask?.status}
+                logs={taskLogs}
+                isExploring={isExploring}
+              />
+
+              <div className="flex items-center justify-between bg-white border border-slate-200 px-4 py-2 rounded-xl text-xs font-mono shadow-xs">
+                <div className="flex items-center gap-2 overflow-x-auto max-w-full">
+                  <span className="text-slate-400 font-bold uppercase text-[10px]">
+                    {t.commandBoard.activeTaskLabel}
+                  </span>
+                  {tasks.map((taskItem) => (
+                    <button
+                      key={taskItem.id}
+                      onClick={() => setSelectedTaskId(taskItem.id)}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-mono font-medium truncate max-w-[200px] transition-all cursor-pointer ${
+                        taskItem.id === selectedTaskId
+                          ? 'bg-indigo-50 text-indigo-700 font-bold border border-indigo-200 shadow-2xs'
+                          : 'text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      {taskItem.title}
+                    </button>
+                  ))}
+                </div>
+
+                <button
+                  onClick={() => setIsModalOpen(true)}
+                  className="flex items-center gap-1 text-indigo-600 hover:text-indigo-800 font-bold text-xs shrink-0 pl-3 border-l border-slate-200 cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>{t.commandBoard.newButton}</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+                <div className="lg:col-span-5 space-y-4">
+                  <RCAPanel
+                    task={activeTask}
+                    patches={activePatches}
+                    logs={taskLogs}
+                  />
+                </div>
+
+                <div className="lg:col-span-7 space-y-4">
+                  <DiffViewer
+                    patches={activePatches}
+                    taskTitle={activeTask?.title}
+                  />
+
+                  <ActionControls
+                    task={activeTask}
+                    patches={activePatches}
+                    onRun={() => activeTask && runMutation.mutate({ taskId: activeTask.id, language, model: selectedModel })}
+                    onApprove={(comment) =>
+                      activeTask &&
+                      approveMutation.mutate({ taskId: activeTask.id, comment, language })
+                    }
+                    onReject={(reason) =>
+                      activeTask &&
+                      rejectMutation.mutate({ taskId: activeTask.id, reason })
+                    }
+                    onReset={() =>
+                      activeTask && resetMutation.mutate(activeTask.id)
+                    }
+                    isRunLoading={runMutation.isPending}
+                    isApproveLoading={approveMutation.isPending}
+                    isRejectLoading={rejectMutation.isPending}
+                    isResetLoading={resetMutation.isPending}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {currentTab === 'logs' && (
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+              <div className="lg:col-span-1">
+                <TaskList
+                  tasks={tasks}
+                  selectedTaskId={selectedTaskId}
+                  onSelectTask={setSelectedTaskId}
+                  onNewTaskClick={() => setIsModalOpen(true)}
+                  isLoading={isTasksLoading}
+                />
+              </div>
+              <div className="lg:col-span-2">
+                <LiveActivityFeed
+                  logs={taskLogs}
+                  isExploring={isExploring}
+                  isLoading={isLogsLoading}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Tab 3: PR & Patch History */}
+          {currentTab === 'prs' && (
+            <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs space-y-4">
+              <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                <div className="flex items-center gap-2">
+                  <GitPullRequest className="w-5 h-5 text-indigo-600" />
+                  <h2 className="text-sm font-bold text-slate-900">
+                    {t.commandBoard.prSectionTitle}
+                  </h2>
+                </div>
+              </div>
+
+              <div className="divide-y divide-slate-100">
+                {tasks.filter((taskItem) => taskItem.status === 'approved' || taskItem.status === 'pr_created' || taskItem.pr_number).length === 0 ? (
+                  <div className="py-8 text-center text-xs text-slate-400 font-mono">
+                    {t.commandBoard.noApprovedPrs}
+                  </div>
+                ) : (
+                  tasks
+                    .filter((taskItem) => taskItem.status === 'approved' || taskItem.status === 'pr_created' || taskItem.pr_number)
+                    .map((taskItem) => (
+                      <div
+                        key={taskItem.id}
+                        className="py-3 flex items-center justify-between flex-wrap gap-2 text-xs font-mono"
+                      >
+                        <div>
+                          <div className="font-bold text-slate-900">{taskItem.title}</div>
+                          <div className="text-[11px] text-slate-500">
+                            {taskItem.repo_full_name} • PR #{taskItem.pr_number || '123'}
+                          </div>
+                        </div>
+
+                        {taskItem.pr_url && (
+                          <a
+                            href={taskItem.pr_url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="flex items-center gap-1.5 px-3 py-1 bg-indigo-50 text-indigo-700 rounded-lg border border-indigo-200 font-bold hover:bg-indigo-100"
+                          >
+                            <span>{t.commandBoard.openOnGithub}</span>
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        )}
+                      </div>
+                    ))
+                )}
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
+
+      <TaskModal
+        isOpen={isModalOpen}
+        onClose={() => setIsModalOpen(false)}
+        onSubmit={(data, autoRun) => createMutation.mutate({ data, autoRun })}
+        isLoading={createMutation.isPending}
+        defaultRepo={activeTask?.repo_full_name || 'NamiraAulia/Virtual-dev-team'}
+      />
+
+      <SentryModal
+        isOpen={isSentryModalOpen}
+        onClose={() => setIsSentryModalOpen(false)}
+        onTestTriggered={() => {
+          qc.invalidateQueries({ queryKey: ['tasks'] });
+        }}
+      />
+    </div>
+  );
 }
 
-export default App
+export function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <LanguageProvider>
+        <DashboardContent />
+      </LanguageProvider>
+    </QueryClientProvider>
+  );
+}
+
+export default App;

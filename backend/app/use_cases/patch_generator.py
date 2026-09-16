@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 from app.domain.patch import PatchSet
 from app.domain.task import TaskRecord, TaskStatus
 from app.infrastructure.ai.gemini_engine import GeminiEngine
+from app.infrastructure.ai.openrouter_engine import OpenRouterEngine
+from app.infrastructure.events.event_bus import task_event_bus
 from app.infrastructure.github.adapter import GitHubAdapter
 
 if TYPE_CHECKING:
@@ -60,6 +62,8 @@ class PatchGeneratorUseCase:
         task_id: str,
         db: SupabaseClient,
         settings: Settings,
+        language: str = "en",
+        model_name: str | None = None,
     ) -> tuple[TaskRecord, PatchSet]:
         """
         Execute the patch generation use case for a given task.
@@ -88,6 +92,7 @@ class PatchGeneratorUseCase:
         logger.info("Use Case: Transitioning task id=%s to 'exploring'", task_id)
         db.update_task_status(task_id, TaskStatus.EXPLORING)
         task = db.get_task(task_id) or task
+        await task_event_bus.publish(task_id, "status_changed", {"status": "exploring"})
 
         # 4. Run AI Exploration & Persist
         try:
@@ -95,14 +100,36 @@ class PatchGeneratorUseCase:
                 token=settings.github_personal_access_token,
                 repo_full_name=task.repo_full_name,
             )
-            engine = self._engine_factory(
-                api_key=settings.google_generative_ai_api_key,
-                github_adapter=github_adapter,
-            )
 
-            logger.info("Use Case: Running Gemini AI exploration for task id=%s", task_id)
+            # Determine engine based on model name
+            is_openrouter_model = bool(model_name and ("/" in model_name or "openrouter" in model_name))
+            if is_openrouter_model:
+                if not settings.openrouter_api_key:
+                    raise ValueError(
+                        "OPENROUTER_API_KEY is not set in backend/.env. "
+                        "Please add OPENROUTER_API_KEY to use OpenRouter models."
+                    )
+                engine = OpenRouterEngine(
+                    api_key=settings.openrouter_api_key,
+                    github_adapter=github_adapter,
+                    model_name=model_name,
+                )
+            else:
+                engine = self._engine_factory(
+                    api_key=settings.google_generative_ai_api_key,
+                    github_adapter=github_adapter,
+                    model_name=model_name or getattr(settings, "gemini_model", None),
+                )
+
+            logger.info(
+                "Use Case: Running AI exploration for task id=%s (engine=%s, language=%s, model=%s)",
+                task_id,
+                type(engine).__name__,
+                language,
+                engine.model_name,
+            )
             # engine.run_exploration automatically writes audit logs to db if db is provided
-            patch_set = await engine.run_exploration(task, db=db)
+            patch_set = await engine.run_exploration(task, db=db, language=language)
 
             # 5. Persist patches
             logger.info("Use Case: Persisting %d patches for task id=%s", len(patch_set.actions), task_id)
@@ -111,6 +138,16 @@ class PatchGeneratorUseCase:
             # 6. Transition status to patch_ready
             updated_task = db.update_task_status(task_id, TaskStatus.PATCH_READY)
             logger.info("Use Case: Task id=%s is now 'patch_ready'", task_id)
+            await task_event_bus.publish(
+                task_id,
+                "patch_ready",
+                {
+                    "status": "patch_ready",
+                    "task_id": task_id,
+                    "patches_count": len(patch_set.actions),
+                    "summary": patch_set.summary,
+                },
+            )
             return (updated_task or task, patch_set)
 
         except Exception as err:
@@ -118,6 +155,11 @@ class PatchGeneratorUseCase:
             # Revert status back to pending
             try:
                 db.update_task_status(task_id, TaskStatus.PENDING)
+                await task_event_bus.publish(
+                    task_id,
+                    "exploration_failed",
+                    {"status": "pending", "error": str(err)},
+                )
             except Exception as revert_err:
                 logger.error("Use Case: Failed to revert task status: %s", revert_err)
 
