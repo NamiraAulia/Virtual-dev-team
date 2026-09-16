@@ -37,7 +37,7 @@ export const api = {
   },
 
   // Trigger autonomous AI exploration (with 3-minute timeout for multi-turn agentic loop)
-  runTask: async (taskId: string, language: string = 'en', model: string = 'gemini-2.0-flash'): Promise<Task> => {
+  runTask: async (taskId: string, language: string = 'en', model: string = 'gemini-flash-latest'): Promise<Task> => {
     const response = await apiClient.post<Task>(
       `/tasks/${taskId}/run?language=${encodeURIComponent(language)}&model=${encodeURIComponent(model)}`,
       null,
@@ -63,10 +63,21 @@ export const api = {
     return response.data;
   },
 
+  // Reset task back to pending
+  resetTask: async (taskId: string): Promise<Task> => {
+    const response = await apiClient.post<Task>(`/tasks/${taskId}/reset`);
+    return response.data;
+  },
+
   // Get audit logs for task
   getTaskLogs: async (taskId: string): Promise<TaskLogEntry[]> => {
     const response = await apiClient.get<TaskLogEntry[]>(`/tasks/${taskId}/logs`);
     return response.data;
+  },
+
+  // Get SSE stream URL for real-time task logs
+  getTaskStreamUrl: (taskId: string): string => {
+    return `${API_BASE_URL}/tasks/${taskId}/stream`;
   },
 
   // Health check
@@ -81,3 +92,4 @@ export const api = {
   },
 
 };
+

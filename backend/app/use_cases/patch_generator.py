@@ -19,6 +19,7 @@ from app.domain.patch import PatchSet
 from app.domain.task import TaskRecord, TaskStatus
 from app.infrastructure.ai.gemini_engine import GeminiEngine
 from app.infrastructure.ai.openrouter_engine import OpenRouterEngine
+from app.infrastructure.events.event_bus import task_event_bus
 from app.infrastructure.github.adapter import GitHubAdapter
 
 if TYPE_CHECKING:
@@ -91,6 +92,7 @@ class PatchGeneratorUseCase:
         logger.info("Use Case: Transitioning task id=%s to 'exploring'", task_id)
         db.update_task_status(task_id, TaskStatus.EXPLORING)
         task = db.get_task(task_id) or task
+        await task_event_bus.publish(task_id, "status_changed", {"status": "exploring"})
 
         # 4. Run AI Exploration & Persist
         try:
@@ -136,6 +138,16 @@ class PatchGeneratorUseCase:
             # 6. Transition status to patch_ready
             updated_task = db.update_task_status(task_id, TaskStatus.PATCH_READY)
             logger.info("Use Case: Task id=%s is now 'patch_ready'", task_id)
+            await task_event_bus.publish(
+                task_id,
+                "patch_ready",
+                {
+                    "status": "patch_ready",
+                    "task_id": task_id,
+                    "patches_count": len(patch_set.actions),
+                    "summary": patch_set.summary,
+                },
+            )
             return (updated_task or task, patch_set)
 
         except Exception as err:
@@ -143,6 +155,11 @@ class PatchGeneratorUseCase:
             # Revert status back to pending
             try:
                 db.update_task_status(task_id, TaskStatus.PENDING)
+                await task_event_bus.publish(
+                    task_id,
+                    "exploration_failed",
+                    {"status": "pending", "error": str(err)},
+                )
             except Exception as revert_err:
                 logger.error("Use Case: Failed to revert task status: %s", revert_err)
 

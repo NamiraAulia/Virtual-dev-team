@@ -25,6 +25,7 @@ from app.domain.patch import PatchAction, PatchProposal, PatchSet
 from app.domain.task import TaskRecord
 from app.domain.task_log import TaskLogEntry
 from app.infrastructure.database.supabase_client import SupabaseClient
+from app.infrastructure.events.event_bus import task_event_bus
 from app.infrastructure.github.adapter import GitHubAdapter
 
 logger = logging.getLogger(__name__)
@@ -76,8 +77,13 @@ class GeminiEngine:
         - max_repair_attempts: 2 (self-repair retry limit on verification failure)
     """
 
-    MODEL_NAME = "gemini-2.0-flash"
-    FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-flash-latest"]
+    MODEL_NAME = "gemini-flash-latest"
+    FALLBACK_MODELS = [
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+    ]
     TEMPERATURE = 0.0
     MAX_TOOL_ROUNDS = 5
     MAX_REPAIR_ATTEMPTS = 2
@@ -110,33 +116,44 @@ class GeminiEngine:
         """
         Calls generate_content using the configured model. If a rate limit (429),
         quota exhaustion, or service unavailability occurs, automatically tries
-        fallback models.
+        fallback models and applies adaptive backoff retry.
         """
+        import time
+
         models_to_try = [self.model_name] + [m for m in self.FALLBACK_MODELS if m != self.model_name]
         last_error = None
 
-        for model_candidate in models_to_try:
-            try:
-                response = self._client.models.generate_content(
-                    model=model_candidate,
-                    contents=contents,
-                    config=config,
-                )
-                if model_candidate != self.model_name:
-                    logger.info("Successfully completed request using fallback model '%s'", model_candidate)
-                    self.model_name = model_candidate
-                return response
-            except Exception as e:
-                err_str = str(e)
-                if any(x in err_str for x in ["429", "RESOURCE_EXHAUSTED", "Quota exceeded", "503", "404", "NOT_FOUND"]):
-                    logger.warning(
-                        "Model '%s' failed with error (%s). Trying fallback candidate...",
-                        model_candidate,
-                        err_str[:200],
+        for attempt in range(2):
+            for model_candidate in models_to_try:
+                try:
+                    response = self._client.models.generate_content(
+                        model=model_candidate,
+                        contents=contents,
+                        config=config,
                     )
-                    last_error = e
-                    continue
-                raise
+                    if model_candidate != self.model_name:
+                        logger.info("Successfully completed request using fallback model '%s'", model_candidate)
+                        self.model_name = model_candidate
+                    return response
+                except Exception as e:
+                    err_str = str(e)
+                    if any(x in err_str for x in ["429", "RESOURCE_EXHAUSTED", "Quota exceeded", "503", "404", "NOT_FOUND"]):
+                        logger.warning(
+                            "Model '%s' failed with error (%s). Trying fallback candidate...",
+                            model_candidate,
+                            err_str[:200],
+                        )
+                        last_error = e
+                        continue
+                    raise
+
+            # If all model candidates failed due to 429 rate limit on first attempt, wait briefly and retry
+            if attempt == 0 and last_error and any(x in str(last_error) for x in ["429", "RESOURCE_EXHAUSTED", "Quota exceeded"]):
+                # Try to extract retry delay from error message, default to 5 seconds
+                delay_match = re.search(r"retry in (\d+(?:\.\d+)?)s", str(last_error))
+                retry_wait = min(float(delay_match.group(1)), 10.0) if delay_match else 5.0
+                logger.info("Gemini RPM limit reached. Auto-waiting %.1fs before retrying...", retry_wait)
+                time.sleep(retry_wait)
 
         raise last_error or RuntimeError("All model candidates failed.")
 
@@ -173,19 +190,23 @@ class GeminiEngine:
 
     def _execute_tool(self, name: str, args: dict[str, Any]) -> Any:
         """Execute a tool call against the GitHub adapter with normalized tool names."""
-        normalized = name.lower().replace("_", "")
-        if normalized == "listdirectory":
-            path = args.get("path", "")
-            return self._github.list_directory(path=path)
-        elif normalized == "readfile":
-            file_path = args.get("file_path", "") or args.get("filePath", "")
-            return self._github.read_file(file_path=file_path)
-        elif normalized == "searchcode":
-            query = args.get("query", "")
-            return self._github.search_code(query=query)
-        else:
-            logger.warning("Unrecognized tool name called: %s", name)
-            return {"error": f"Unknown tool: '{name}'"}
+        try:
+            normalized = name.lower().replace("_", "")
+            if normalized == "listdirectory":
+                path = args.get("path", "")
+                return self._github.list_directory(path=path)
+            elif normalized == "readfile":
+                file_path = args.get("file_path", "") or args.get("filePath", "")
+                return self._github.read_file(file_path=file_path)
+            elif normalized == "searchcode":
+                query = args.get("query", "")
+                return self._github.search_code(query=query)
+            else:
+                logger.warning("Unrecognized tool name called: %s", name)
+                return {"error": f"Unknown tool: '{name}'"}
+        except Exception as tool_err:
+            logger.error("Execution error in tool '%s' (args=%s): %s", name, args, tool_err)
+            return {"error": f"Tool '{name}' failed: {str(tool_err)}"}
 
     def _extract_patch_set(self, response_text: str, task_id: str) -> PatchSet:
         """
@@ -265,16 +286,26 @@ class GeminiEngine:
 
 
     def _extract_response_text(self, response: types.GenerateContentResponse) -> str:
-        """Safely extract plain text from Gemini response, including multi-part candidates."""
-        if response.text and response.text.strip():
-            return response.text.strip()
-
+        """Safely extract plain text from Gemini response, including multi-part and thought parts."""
+        parts_text: list[str] = []
         if response.candidates and len(response.candidates) > 0:
             content = response.candidates[0].content
             if content and content.parts:
-                parts_text = [p.text for p in content.parts if p.text and p.text.strip()]
-                if parts_text:
-                    return "\n".join(parts_text).strip()
+                for p in content.parts:
+                    if getattr(p, "text", None) and p.text and p.text.strip():
+                        parts_text.append(p.text.strip())
+                    elif getattr(p, "function_call", None):
+                        fc = p.function_call
+                        if fc and fc.args:
+                            parts_text.append(json.dumps(fc.args))
+        if parts_text:
+            return "\n".join(parts_text).strip()
+
+        try:
+            if response.text and response.text.strip():
+                return response.text.strip()
+        except Exception:
+            pass
 
         return ""
 
@@ -395,11 +426,51 @@ class GeminiEngine:
             tools=self._get_tools(),
         )
 
+        # Pre-fetch relevant files from task text to accelerate exploration
+        prefetched = self._github.prefetch_relevant_files(f"{task.title}\n{task.description}")
+        context_blocks: list[str] = []
+        if prefetched and isinstance(prefetched, dict) and len(prefetched) > 0:
+            logger.info("Task id=%s | Pre-fetched %d relevant file(s): %s", task.id, len(prefetched), list(prefetched.keys()))
+            for p_path, p_content in prefetched.items():
+                context_blocks.append(f"--- [Pre-fetched File: {p_path}] ---\n{p_content}\n--- [End of {p_path}] ---")
+
+            log_entry = TaskLogEntry(
+                task_id=task.id,
+                step_number=1,
+                tool_name="prefetch_files",
+                tool_input={"files": list(prefetched.keys())},
+                tool_output=f"Successfully pre-fetched {len(prefetched)} files: {', '.join(prefetched.keys())}",
+                created_at=datetime.now(timezone.utc),
+            )
+            if db:
+                try:
+                    db.append_log(log_entry)
+                except Exception as log_err:
+                    logger.warning("Failed to write prefetch log: %s", log_err)
+            await task_event_bus.publish(task.id, "log", log_entry.model_dump(mode="json"))
+
+        context_str = ""
+        if context_blocks:
+            joined_files = "\n\n".join(context_blocks)
+            if language == "id":
+                context_str = (
+                    f"\n\n[Konteks File Otomatis Ditemukan]:\n{joined_files}\n\n"
+                    "PETUNJUK: Konten file yang relevan di atas sudah disediakan. "
+                    "Jika informasi ini sudah cukup untuk memperbaiki masalah, Anda DAPAT LANGSUNG menghasilkan JSON PatchSet final tanpa perlu memanggil tools lagi."
+                )
+            else:
+                context_str = (
+                    f"\n\n[Pre-fetched File Context]:\n{joined_files}\n\n"
+                    "NOTE: The relevant file contents have been pre-fetched above. "
+                    "If this information is sufficient to resolve the task, you may IMMEDIATELY output the final PatchSet JSON without making tool calls."
+                )
+
         if language == "id":
             user_prompt = (
                 f"Repository: {task.repo_full_name}\n"
                 f"Judul Tugas: {task.title}\n"
-                f"Deskripsi Tugas:\n{task.description}\n\n"
+                f"Deskripsi Tugas:\n{task.description}"
+                f"{context_str}\n\n"
                 "Silakan telusuri repositori untuk mengidentifikasi masalah, verifikasi kode yang relevan, "
                 "dan hasilkan JSON PatchSet final dengan ringkasan (summary) dan penjelasan (explanation) dalam Bahasa Indonesia."
             )
@@ -407,7 +478,8 @@ class GeminiEngine:
             user_prompt = (
                 f"Repository: {task.repo_full_name}\n"
                 f"Task Title: {task.title}\n"
-                f"Task Description:\n{task.description}\n\n"
+                f"Task Description:\n{task.description}"
+                f"{context_str}\n\n"
                 "Please explore the repository to locate the issue, verify the relevant code, "
                 "and output the final PatchSet JSON."
             )
@@ -416,7 +488,7 @@ class GeminiEngine:
             types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])
         ]
 
-        step_counter = 0
+        step_counter = 1 if prefetched else 0
         round_counter = 0
 
         while round_counter < self.MAX_TOOL_ROUNDS:
@@ -466,20 +538,21 @@ class GeminiEngine:
 
                 tool_result = self._execute_tool(tool_name, tool_args)
 
-                # Record audit log in database if available
+                # Record audit log and publish real-time SSE event
+                log_entry = TaskLogEntry(
+                    task_id=task.id,
+                    step_number=step_counter,
+                    tool_name=tool_name,
+                    tool_input=tool_args,
+                    tool_output=json.dumps(tool_result)[:4000],
+                    created_at=datetime.now(timezone.utc),
+                )
                 if db:
                     try:
-                        log_entry = TaskLogEntry(
-                            task_id=task.id,
-                            step_number=step_counter,
-                            tool_name=tool_name,
-                            tool_input=tool_args,
-                            tool_output=json.dumps(tool_result)[:4000],
-                            created_at=datetime.now(timezone.utc),
-                        )
                         db.append_log(log_entry)
                     except Exception as log_err:
                         logger.warning("Failed to record task audit log: %s", log_err)
+                await task_event_bus.publish(task.id, "log", log_entry.model_dump(mode="json"))
 
                 tool_response_parts.append(
                     types.Part.from_function_response(
@@ -488,8 +561,8 @@ class GeminiEngine:
                     )
                 )
 
-            # Append tool outputs back to conversation
-            contents.append(types.Content(role="user", parts=tool_response_parts))
+            # Append tool outputs back to conversation with role='tool'
+            contents.append(types.Content(role="tool", parts=tool_response_parts))
 
         # If guardrail reached (5 rounds) and still calling tools, request immediate synthesis
         logger.warning(
@@ -516,7 +589,7 @@ class GeminiEngine:
             config=final_config,
         )
 
-        if final_response.candidates and final_response.candidates[0].content:
+        if final_response.candidates and len(final_response.candidates) > 0 and final_response.candidates[0].content:
             contents.append(final_response.candidates[0].content)
 
         response_text = self._extract_response_text(final_response)

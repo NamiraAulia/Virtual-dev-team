@@ -22,6 +22,7 @@ from app.domain.patch import PatchAction, PatchProposal, PatchSet
 from app.domain.task import TaskRecord
 from app.domain.task_log import TaskLogEntry
 from app.infrastructure.database.supabase_client import SupabaseClient
+from app.infrastructure.events.event_bus import task_event_bus
 from app.infrastructure.github.adapter import GitHubAdapter
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ class OpenRouterEngine:
     Autonomous AI agent powered by OpenRouter API.
     """
 
-    DEFAULT_MODEL = "google/gemma-4-26b-a4b-it:free"
+    DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning:free"
     TEMPERATURE = 0.0
     MAX_TOOL_ROUNDS = 5
     MAX_REPAIR_ATTEMPTS = 2
@@ -158,18 +159,44 @@ class OpenRouterEngine:
 
     def _extract_patch_set(self, response_text: str, task_id: str) -> PatchSet:
         text = response_text.strip()
-        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-        if json_match:
-            raw_json = json_match.group(1).strip()
-        else:
-            brace_match = re.search(r"(\{[\s\S]*\})", text)
-            raw_json = brace_match.group(1).strip() if brace_match else text
+        data = None
 
-        try:
-            data = json.loads(raw_json)
-        except json.JSONDecodeError as err:
-            logger.error("Failed to parse PatchSet JSON: %s\nText: %s", err, text)
-            raise ValueError(f"AI response is not valid JSON: {err}") from err
+        # 1. First, search for fenced ```json ... ``` code blocks
+        for json_match in re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", text):
+            candidate = json_match.group(1).strip()
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict) and "actions" in parsed:
+                    data = parsed
+                    break
+            except Exception:
+                continue
+
+        # 2. If not found in code fence, scan for { ... } containing "actions"
+        if data is None:
+            for start_idx in range(len(text)):
+                if text[start_idx] == '{':
+                    for end_idx in range(len(text), start_idx + 5, -1):
+                        if text[end_idx - 1] == '}':
+                            substring = text[start_idx:end_idx].strip()
+                            if '"actions"' in substring:
+                                try:
+                                    parsed = json.loads(substring)
+                                    if isinstance(parsed, dict) and "actions" in parsed:
+                                        data = parsed
+                                        break
+                                except Exception:
+                                    continue
+                    if data:
+                        break
+
+        # 3. Fallback to direct json.loads
+        if data is None:
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as err:
+                logger.error("Failed to parse PatchSet JSON: %s\nText: %s", err, text)
+                raise ValueError(f"AI response is not valid JSON: {err}") from err
 
         summary = data.get("summary", "Automated AI patch")
         actions_raw = data.get("actions", [])
@@ -245,6 +272,30 @@ class OpenRouterEngine:
                 raise RuntimeError(f"OpenRouter API error {resp.status_code}: {resp.text}")
             return resp.json()
 
+    def _extract_text_tool_calls(self, content: str) -> list[dict[str, Any]]:
+        """Extract tool calls if the model emitted them as XML/text tags instead of standard OpenAI tool_calls."""
+        calls = []
+        # Pattern 1: <function=name><parameter=key>value</parameter></function>
+        for m in re.finditer(r"<function=([a-zA-Z0-9_]+)>([\s\S]*?)</function>", content):
+            fn_name = m.group(1).strip()
+            body = m.group(2)
+            args = {}
+            for p in re.finditer(r"<parameter=([a-zA-Z0-9_]+)>\s*([\s\S]*?)\s*</parameter>", body):
+                args[p.group(1).strip()] = p.group(2).strip()
+            calls.append({"name": fn_name, "arguments": args})
+
+        # Pattern 2: JSON formatted tool call inside ```json ``` or ``` ```
+        if not calls:
+            for jm in re.finditer(r"```(?:json)?\s*(\{\s*\"name\"\s*:\s*\"[a-zA-Z0-9_]+\"[\s\S]*?\})\s*```", content):
+                try:
+                    parsed = json.loads(jm.group(1))
+                    if "name" in parsed:
+                        calls.append({"name": parsed["name"], "arguments": parsed.get("arguments", {})})
+                except Exception:
+                    pass
+
+        return calls
+
     async def run_exploration(
         self,
         task: TaskRecord,
@@ -266,11 +317,51 @@ class OpenRouterEngine:
                 "The JSON schema keys, file paths, search_block, and replace_block must remain exact code and must NOT be translated."
             )
 
+        # Pre-fetch relevant files from task text to accelerate exploration
+        prefetched = self._github.prefetch_relevant_files(f"{task.title}\n{task.description}")
+        context_blocks: list[str] = []
+        if prefetched and isinstance(prefetched, dict) and len(prefetched) > 0:
+            logger.info("OpenRouter Task id=%s | Pre-fetched %d relevant file(s): %s", task.id, len(prefetched), list(prefetched.keys()))
+            for p_path, p_content in prefetched.items():
+                context_blocks.append(f"--- [Pre-fetched File: {p_path}] ---\n{p_content}\n--- [End of {p_path}] ---")
+
+            log_entry = TaskLogEntry(
+                task_id=task.id,
+                step_number=1,
+                tool_name="prefetch_files",
+                tool_input={"files": list(prefetched.keys())},
+                tool_output=f"Successfully pre-fetched {len(prefetched)} files: {', '.join(prefetched.keys())}",
+                created_at=datetime.now(timezone.utc),
+            )
+            if db:
+                try:
+                    db.append_log(log_entry)
+                except Exception as log_err:
+                    logger.warning("Failed to write prefetch log: %s", log_err)
+            await task_event_bus.publish(task.id, "log", log_entry.model_dump(mode="json"))
+
+        context_str = ""
+        if context_blocks:
+            joined_files = "\n\n".join(context_blocks)
+            if language == "id":
+                context_str = (
+                    f"\n\n[Konteks File Otomatis Ditemukan]:\n{joined_files}\n\n"
+                    "PETUNJUK: Konten file yang relevan di atas sudah disediakan. "
+                    "Jika informasi ini sudah cukup untuk memperbaiki masalah, Anda DAPAT LANGSUNG menghasilkan JSON PatchSet final tanpa perlu memanggil tools lagi."
+                )
+            else:
+                context_str = (
+                    f"\n\n[Pre-fetched File Context]:\n{joined_files}\n\n"
+                    "NOTE: The relevant file contents have been pre-fetched above. "
+                    "If this information is sufficient to resolve the task, you may IMMEDIATELY output the final PatchSet JSON without making tool calls."
+                )
+
         if language == "id":
             user_prompt = (
                 f"Repository: {task.repo_full_name}\n"
                 f"Judul Tugas: {task.title}\n"
-                f"Deskripsi Tugas:\n{task.description}\n\n"
+                f"Deskripsi Tugas:\n{task.description}"
+                f"{context_str}\n\n"
                 "Silakan telusuri repositori menggunakan tools untuk mengidentifikasi masalah, "
                 "verifikasi kode yang relevan, dan hasilkan JSON PatchSet final dengan ringkasan (summary) "
                 "dan penjelasan (explanation) dalam Bahasa Indonesia."
@@ -279,7 +370,8 @@ class OpenRouterEngine:
             user_prompt = (
                 f"Repository: {task.repo_full_name}\n"
                 f"Task Title: {task.title}\n"
-                f"Task Description:\n{task.description}\n\n"
+                f"Task Description:\n{task.description}"
+                f"{context_str}\n\n"
                 "Please explore the repository using tools to locate the issue, verify the relevant code, "
                 "and output the final PatchSet JSON."
             )
@@ -290,7 +382,7 @@ class OpenRouterEngine:
         ]
 
         tools = self._get_tools_schema()
-        step_counter = 0
+        step_counter = 1 if prefetched else 0
         round_counter = 0
 
         while round_counter < self.MAX_TOOL_ROUNDS:
@@ -306,44 +398,83 @@ class OpenRouterEngine:
             messages.append(message)
 
             tool_calls = message.get("tool_calls", [])
+            text_tool_calls: list[dict[str, Any]] = []
+
             if not tool_calls:
-                # No tool calls -> final response
                 content_text = message.get("content", "") or ""
-                return await self._resolve_and_verify(content_text, task, messages)
+                text_tool_calls = self._extract_text_tool_calls(content_text)
+                if not text_tool_calls:
+                    # Truly final synthesis response
+                    return await self._resolve_and_verify(content_text, task, messages)
 
-            # Execute tool calls
-            for tc in tool_calls:
-                step_counter += 1
-                fn = tc.get("function", {})
-                tool_name = fn.get("name", "")
-                try:
-                    tool_args = json.loads(fn.get("arguments", "{}"))
-                except Exception:
-                    tool_args = {}
-
-                logger.info("OpenRouter Step %d: tool '%s' args=%s", step_counter, tool_name, tool_args)
-                tool_result = self._execute_tool(tool_name, tool_args)
-
-                if db:
+            # Handle standard OpenAI tool_calls
+            if tool_calls:
+                for tc in tool_calls:
+                    step_counter += 1
+                    fn = tc.get("function", {})
+                    tool_name = fn.get("name", "")
                     try:
-                        log_entry = TaskLogEntry(
-                            task_id=task.id,
-                            step_number=step_counter,
-                            tool_name=tool_name,
-                            tool_input=tool_args,
-                            tool_output=json.dumps(tool_result)[:4000],
-                            created_at=datetime.now(timezone.utc),
-                        )
-                        db.append_log(log_entry)
-                    except Exception as log_err:
-                        logger.warning("Failed to record task audit log: %s", log_err)
+                        tool_args = json.loads(fn.get("arguments", "{}"))
+                    except Exception:
+                        tool_args = {}
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id"),
-                    "name": tool_name,
-                    "content": json.dumps({"result": tool_result}),
-                })
+                    logger.info("OpenRouter Step %d: tool '%s' args=%s", step_counter, tool_name, tool_args)
+                    tool_result = self._execute_tool(tool_name, tool_args)
+
+                    log_entry = TaskLogEntry(
+                        task_id=task.id,
+                        step_number=step_counter,
+                        tool_name=tool_name,
+                        tool_input=tool_args,
+                        tool_output=json.dumps(tool_result)[:4000],
+                        created_at=datetime.now(timezone.utc),
+                    )
+                    if db:
+                        try:
+                            db.append_log(log_entry)
+                        except Exception as log_err:
+                            logger.warning("Failed to record task audit log: %s", log_err)
+                    await task_event_bus.publish(task.id, "log", log_entry.model_dump(mode="json"))
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id"),
+                        "name": tool_name,
+                        "content": json.dumps({"result": tool_result}),
+                    })
+            # Handle text/XML tool_calls
+            elif text_tool_calls:
+                for pt in text_tool_calls:
+                    step_counter += 1
+                    tool_name = pt["name"]
+                    tool_args = pt["arguments"]
+
+                    logger.info("OpenRouter Step %d (text-parsed): tool '%s' args=%s", step_counter, tool_name, tool_args)
+                    tool_result = self._execute_tool(tool_name, tool_args)
+
+                    log_entry = TaskLogEntry(
+                        task_id=task.id,
+                        step_number=step_counter,
+                        tool_name=tool_name,
+                        tool_input=tool_args,
+                        tool_output=json.dumps(tool_result)[:4000],
+                        created_at=datetime.now(timezone.utc),
+                    )
+                    if db:
+                        try:
+                            db.append_log(log_entry)
+                        except Exception as log_err:
+                            logger.warning("Failed to record task audit log: %s", log_err)
+                    await task_event_bus.publish(task.id, "log", log_entry.model_dump(mode="json"))
+
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"Tool '{tool_name}' executed. Output:\n"
+                            f"```json\n{json.dumps(tool_result, indent=2)}\n```\n"
+                            "Continue your exploration using tools if needed, or output your final PatchSet JSON if you have enough information."
+                        ),
+                    })
 
         # Max tool rounds reached -> request final synthesis
         messages.append({

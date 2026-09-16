@@ -7,11 +7,14 @@ REST endpoints for the Command Board frontend to create, list,
 approve tasks, and view audit logs.
 """
 
+import asyncio
+import json
 import logging
 from typing import Optional, List
 
 # pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from fastapi.responses import StreamingResponse
 
 from app.config import Settings, get_settings
 from app.domain.patch import PatchRecord
@@ -19,6 +22,7 @@ from app.domain.task import TaskCreate, TaskRecord, TaskStatus
 from app.domain.task_log import TaskLogEntry
 from app.infrastructure.ai.gemini_engine import GeminiEngine
 from app.infrastructure.database.supabase_client import SupabaseClient
+from app.infrastructure.events.event_bus import task_event_bus
 from app.infrastructure.github.adapter import GitHubAdapter
 
 logger = logging.getLogger(__name__)
@@ -88,6 +92,54 @@ def get_task(
     return TaskDetailResponse(task=task, patches=patches)
 
 
+@router.get("/{task_id}/stream")
+async def stream_task_events(
+    task_id: str,
+    request: Request,
+    db: SupabaseClient = Depends(get_db),
+) -> StreamingResponse:
+    """
+    Server-Sent Events (SSE) stream for real-time task logs, status updates, and patches.
+    Eliminates the need for frontend HTTP polling.
+    """
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+
+    async def event_generator():
+        queue = task_event_bus.subscribe(task_id)
+        try:
+            # Send initial connection event
+            init_msg = json.dumps({
+                "type": "connected",
+                "data": {"task_id": task_id, "status": task.status.value},
+            })
+            yield f"data: {init_msg}\n\n"
+
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except asyncio.TimeoutError:
+                    # Keep-alive heartbeat ping
+                    yield ": ping\n\n"
+        finally:
+            task_event_bus.unsubscribe(task_id, queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 from app.use_cases.patch_generator import (
     PatchGeneratorUseCase,
     TaskNotFoundError,
@@ -130,6 +182,21 @@ async def run_task(
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 
+@router.post("/{task_id}/reset", response_model=TaskRecord)
+async def reset_task(
+    task_id: str,
+    db: SupabaseClient = Depends(get_db),
+) -> TaskRecord:
+    """Reset a task back to pending status (useful for stuck or failed tasks)."""
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+    updated = db.update_task_status(task_id, TaskStatus.PENDING)
+    await task_event_bus.publish(task_id, "status_changed", {"status": "pending"})
+    logger.info("API: Task id=%s reset back to 'pending'", task_id)
+    return updated or task
+
+
 def parse_sentry_payload(payload: dict, default_repo: str) -> tuple[str, str, str]:
     """Extract issue title, detailed description, and repo from Sentry webhook payload."""
     title = ""
@@ -165,9 +232,11 @@ def parse_sentry_payload(payload: dict, default_repo: str) -> tuple[str, str, st
         description_lines.append(f"**Sentry Issue Link:** {sentry_url}")
 
     # Extract stacktrace or exception details if available
+    entries = event.get("entries") if isinstance(event.get("entries"), list) else []
+    first_entry = entries[0] if len(entries) > 0 else {}
     exception_values = (
-        event.get("entries", [{}])[0].get("data", {}).get("values")
-        or event.get("exception", {}).get("values")
+        first_entry.get("data", {}).get("values")
+        or (event.get("exception", {}).get("values") if isinstance(event.get("exception"), dict) else [])
         or []
     )
     if exception_values:

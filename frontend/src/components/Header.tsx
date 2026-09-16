@@ -2,7 +2,6 @@ import React from 'react';
 import {
   Plus,
   FolderGit2,
-  User,
   Languages,
 } from 'lucide-react';
 import { useLanguage } from '../context/LanguageContext';
@@ -24,17 +23,8 @@ export const Header: React.FC<HeaderProps> = ({
 
   return (
     <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between sticky top-0 z-20 shadow-xs">
-      {/* Left: Brand Badge, Repo & Backend Pill */}
+      {/* Left: Active Repo & Backend Status */}
       <div className="flex items-center gap-3 flex-wrap">
-        <div className="flex items-center gap-2">
-          <span className="font-extrabold text-sm text-slate-900 tracking-tight">
-            {t.header.brandName}
-          </span>
-          <span className="text-[10px] font-mono font-bold bg-slate-100 text-slate-700 px-2 py-0.5 rounded border border-slate-200 uppercase tracking-wide">
-            {t.header.engineBadge}
-          </span>
-        </div>
-
         <div className="hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-lg bg-slate-50 border border-slate-200 text-xs font-mono text-slate-700">
           <FolderGit2 className="w-3.5 h-3.5 text-slate-500" />
           <span className="font-semibold text-slate-900">{t.header.repoLabel}</span>
@@ -56,10 +46,8 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
       </div>
 
-      {/* Right: Model Selector, Language Switcher, Sentry Setup, + New Task & Profile Avatar */}
+      {/* Right: Sentry Webhook, Language Switcher, & New Task Button */}
       <div className="flex items-center gap-2.5 flex-wrap">
-
-        {/* Sentry Webhook Integration Button */}
         {onSentryClick && (
           <button
             onClick={onSentryClick}
@@ -108,11 +96,6 @@ export const Header: React.FC<HeaderProps> = ({
             {t.header.ctrlShortcut}
           </kbd>
         </button>
-
-        {/* User Profile Avatar */}
-        <div className="w-8 h-8 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-600 shadow-xs cursor-pointer hover:border-slate-300">
-          <User className="w-4 h-4 text-slate-600" />
-        </div>
       </div>
     </header>
   );

@@ -68,3 +68,23 @@ async def trigger_error():
     # pyrefly: ignore [division-by-zero]
     division_by_zero = 1 / 0
     return {"result": division_by_zero}
+
+
+@app.get("/api/v1/trigger-sample-error")
+async def trigger_sample_error():
+    """
+    Simulasi error realistis: KeyError pada data transaksi belanja.
+    Error ini akan otomatis tertangkap oleh Sentry dan diproses oleh AI.
+    """
+    # Simulasi data keranjang belanja pembeli
+    user_cart = {
+        "item_name": "Keyboard Mechanical",
+        "price": 500000,
+        "user_email": "customer@example.com",
+    }
+    
+    # ❌ BUG: Mencoba mengakses key 'discount' yang tidak ada di dictionary
+    # Ini akan memicu KeyError: 'discount'
+    final_price = user_cart["price"] - user_cart["discount"]
+    
+    return {"status": "success", "final_price": final_price}

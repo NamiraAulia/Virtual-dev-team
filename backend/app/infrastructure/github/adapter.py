@@ -27,6 +27,7 @@ class GitHubAdapter:
         self._github = Github(token)
         self._repo = self._github.get_repo(repo_full_name)
         self.repo_full_name = repo_full_name
+        self._file_cache: dict[str, dict] = {}
 
     def list_directory(self, path: str = "") -> list[dict]:
         """
@@ -61,14 +62,18 @@ class GitHubAdapter:
         Enforces a 100KB size limit as a security guardrail.
         Returns a dict with 'path', 'content', and 'size'.
         """
+        clean_path = file_path.strip().lstrip("/")
+        if clean_path in self._file_cache:
+            return self._file_cache[clean_path]
+
         try:
-            file_content = self._repo.get_contents(file_path)
+            file_content = self._repo.get_contents(clean_path)
 
             # Guard: reject files larger than 100KB
             if file_content.size > MAX_FILE_SIZE_BYTES:
                 return {
                     "error": (
-                        f"File '{file_path}' is {file_content.size} bytes, "
+                        f"File '{clean_path}' is {file_content.size} bytes, "
                         f"exceeding the {MAX_FILE_SIZE_BYTES} byte limit. "
                         "Try reading a smaller file or a specific section."
                     )
@@ -77,17 +82,52 @@ class GitHubAdapter:
             # Decode content from base64
             content = base64.b64decode(file_content.content).decode("utf-8")
 
-            return {
+            res = {
                 "path": file_content.path,
                 "content": content,
                 "size": file_content.size,
                 "encoding": "utf-8",
             }
+            self._file_cache[clean_path] = res
+            return res
         except GithubException as e:
-            logger.error("readFile failed for path='%s': %s", file_path, e)
-            return {"error": f"Failed to read file '{file_path}': {e.data.get('message', str(e))}"}
+            logger.error("readFile failed for path='%s': %s", clean_path, e)
+            return {"error": f"Failed to read file '{clean_path}': {e.data.get('message', str(e))}"}
         except UnicodeDecodeError:
-            return {"error": f"File '{file_path}' is not a valid UTF-8 text file (binary?)."}
+            return {"error": f"File '{clean_path}' is not a valid UTF-8 text file (binary?)."}
+
+    def prefetch_relevant_files(self, text: str) -> dict[str, str]:
+        """
+        Extract candidate file paths from stack traces or descriptions,
+        and pre-fetch their contents to accelerate AI exploration.
+        """
+        import re
+
+        # Regex to find typical repo file paths like backend/app/main.py, src/App.tsx, etc.
+        pattern = r"(?:[\w\-.]+/)+[\w\-.]+\.(?:py|tsx|ts|js|jsx|json|html|css|yaml|yml|md|env|sql)"
+        matches = set(re.findall(pattern, text))
+        prefetched: dict[str, str] = {}
+
+        for raw_path in matches:
+            clean = raw_path.strip().lstrip("/")
+            # Skip URLs or common false positives
+            if any(clean.startswith(prefix) for prefix in ["http:", "https:", "git:", "node_modules/"]):
+                continue
+
+            file_res = self.read_file(clean)
+            if "content" in file_res and not file_res.get("error"):
+                prefetched[clean] = file_res["content"]
+                continue
+
+            # Try stripping leading segments (e.g. Virtual-dev-team/backend/app.py -> backend/app.py)
+            parts = clean.split("/")
+            if len(parts) > 1:
+                subpath = "/".join(parts[1:])
+                file_res2 = self.read_file(subpath)
+                if "content" in file_res2 and not file_res2.get("error"):
+                    prefetched[subpath] = file_res2["content"]
+
+        return prefetched
 
     def search_code(self, query: str) -> list[dict]:
         """
@@ -102,15 +142,20 @@ class GitHubAdapter:
             results = self._github.search_code(full_query)
 
             items = []
-            for item in results[:10]:
-                items.append(
-                    {
-                        "path": item.path,
-                        "name": item.name,
-                        "html_url": item.html_url,
-                        "repository": item.repository.full_name,
-                    }
-                )
+            try:
+                for idx, item in enumerate(results):
+                    if idx >= 10:
+                        break
+                    items.append(
+                        {
+                            "path": item.path,
+                            "name": item.name,
+                            "html_url": item.html_url,
+                            "repository": item.repository.full_name,
+                        }
+                    )
+            except (IndexError, StopIteration):
+                pass
 
             if not items:
                 return [{"message": f"No results found for query: '{query}'"}]
@@ -119,6 +164,9 @@ class GitHubAdapter:
         except GithubException as e:
             logger.error("searchCode failed for query='%s': %s", query, e)
             return [{"error": f"Search failed for '{query}': {e.data.get('message', str(e))}"}]
+        except Exception as e:
+            logger.error("searchCode unexpected error for query='%s': %s", query, e)
+            return [{"message": f"No results found or search failed for '{query}': {str(e)}"}]
 
     #  PR Pipeline — used after human approval                           
 

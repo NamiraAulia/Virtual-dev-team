@@ -12,7 +12,7 @@ import {
   Plus,
 } from 'lucide-react';
 import { api } from './api/client';
-import type { TaskCreateInput, Task } from './types';
+import type { TaskCreateInput, Task, TaskLogEntry } from './types';
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { PipelineStages } from './components/PipelineStages';
@@ -40,7 +40,7 @@ function DashboardContent() {
   const { language, t } = useLanguage();
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedModel, setSelectedModelState] = useState<string>(() => {
-    return localStorage.getItem('patchops_ai_model') || 'gemini-2.0-flash';
+    return localStorage.getItem('patchops_ai_model') || 'gemini-flash-latest';
   });
 
   const setSelectedModel = (modelId: string) => {
@@ -57,11 +57,9 @@ function DashboardContent() {
   const [isBackendConnected, setIsBackendConnected] = useState(true);
   const [currentTab, setCurrentTab] = useState<'dashboard' | 'logs' | 'prs'>('dashboard');
 
-  // 1. Fetch all tasks
   const { data: tasks = [], isLoading: isTasksLoading } = useQuery<Task[]>({
     queryKey: ['tasks'],
     queryFn: api.getTasks,
-    refetchInterval: 2500,
   });
 
   // 2. Health check
@@ -75,7 +73,7 @@ function DashboardContent() {
       }
     };
     check();
-    const interval = setInterval(check, 10000);
+    const interval = setInterval(check, 15000);
     return () => clearInterval(interval);
   }, []);
 
@@ -98,26 +96,65 @@ function DashboardContent() {
     }
   }, [tasks, selectedTaskId]);
 
-  // 3. Fetch active task detail & patches
+  // 3. Fetch active task detail & patches (no polling needed - handled via SSE)
   const { data: taskDetail } = useQuery({
     queryKey: ['task', selectedTaskId],
     queryFn: () => (selectedTaskId ? api.getTask(selectedTaskId) : null),
     enabled: !!selectedTaskId,
-    refetchInterval: (query) =>
-      query.state.data?.task?.status === 'exploring' ? 1200 : false,
-  });
-
-  // 4. Fetch live audit logs for the selected task
-  const { data: taskLogs = [], isLoading: isLogsLoading } = useQuery({
-    queryKey: ['task_logs', selectedTaskId],
-    queryFn: () => (selectedTaskId ? api.getTaskLogs(selectedTaskId) : []),
-    enabled: !!selectedTaskId,
-    refetchInterval: 1200,
   });
 
   const activeTask = taskDetail?.task || tasks.find((t) => t.id === selectedTaskId);
   const activePatches = taskDetail?.patches || [];
   const isExploring = activeTask?.status === 'exploring';
+
+  const { data: taskLogs = [], isLoading: isLogsLoading } = useQuery({
+    queryKey: ['task_logs', selectedTaskId],
+    queryFn: () => (selectedTaskId ? api.getTaskLogs(selectedTaskId) : []),
+    enabled: !!selectedTaskId,
+  });
+
+  // Real-time Server-Sent Events (SSE) Stream
+  useEffect(() => {
+    if (!selectedTaskId || !isExploring) return;
+
+    const streamUrl = api.getTaskStreamUrl(selectedTaskId);
+    const eventSource = new EventSource(streamUrl);
+
+    eventSource.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload.type === 'log') {
+          qc.setQueryData<TaskLogEntry[]>(['task_logs', selectedTaskId], (oldLogs = []) => {
+            const exists = oldLogs.some(
+              (l) =>
+                l.step_number === payload.data.step_number &&
+                l.tool_name === payload.data.tool_name
+            );
+            if (exists) return oldLogs;
+            return [...oldLogs, payload.data];
+          });
+        } else if (
+          payload.type === 'patch_ready' ||
+          payload.type === 'status_changed' ||
+          payload.type === 'exploration_failed'
+        ) {
+          qc.invalidateQueries({ queryKey: ['task', selectedTaskId] });
+          qc.invalidateQueries({ queryKey: ['tasks'] });
+          qc.invalidateQueries({ queryKey: ['task_logs', selectedTaskId] });
+        }
+      } catch {
+        // Ping or non-json message
+      }
+    };
+
+    eventSource.onerror = () => {
+      // EventSource automatically retries on disconnect
+    };
+
+    return () => {
+      eventSource.close();
+    };
+  }, [selectedTaskId, isExploring, qc]);
 
   // Mutations
   const createMutation = useMutation({
@@ -147,6 +184,22 @@ function DashboardContent() {
       qc.invalidateQueries({ queryKey: ['task', selectedTaskId] });
       qc.invalidateQueries({ queryKey: ['task_logs', selectedTaskId] });
     },
+    onError: (err: any) => {
+      qc.invalidateQueries({ queryKey: ['tasks'] });
+      qc.invalidateQueries({ queryKey: ['task', selectedTaskId] });
+      qc.invalidateQueries({ queryKey: ['task_logs', selectedTaskId] });
+      const detail = err?.response?.data?.detail || err?.message || 'Error occurred';
+      alert(`Autonomous AI Error: ${detail}`);
+    },
+  });
+
+  const resetMutation = useMutation({
+    mutationFn: (taskId: string) => api.resetTask(taskId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['tasks'] });
+      qc.invalidateQueries({ queryKey: ['task', selectedTaskId] });
+      qc.invalidateQueries({ queryKey: ['task_logs', selectedTaskId] });
+    },
   });
 
   const approveMutation = useMutation({
@@ -171,7 +224,6 @@ function DashboardContent() {
 
   return (
     <div className="min-h-screen bg-slate-50 flex text-slate-900">
-      {/* Left Sidebar */}
       <Sidebar
         currentTab={currentTab}
         onTabChange={setCurrentTab}
@@ -180,9 +232,7 @@ function DashboardContent() {
         onModelChange={setSelectedModel}
       />
 
-      {/* Main Workspace Area */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Top Header */}
         <Header
           onNewTaskClick={() => setIsModalOpen(true)}
           onSentryClick={() => setIsSentryModalOpen(true)}
@@ -190,26 +240,21 @@ function DashboardContent() {
           activeRepo={activeRepo}
         />
 
-        {/* Workspace Body */}
         <main className="flex-1 p-6 space-y-5 overflow-y-auto">
-          {/* Top Stage Pipeline Stepper */}
           <PipelineStages
             status={activeTask?.status}
             hasPatches={activePatches.length > 0}
             hasPr={!!activeTask?.pr_number}
           />
 
-          {/* Tab 1: Command Board (Main Reference Design) */}
           {currentTab === 'dashboard' && (
             <div className="space-y-5">
-              {/* Live Turn & Telemetry Banner */}
               <LiveTurnBanner
                 status={activeTask?.status}
                 logs={taskLogs}
                 isExploring={isExploring}
               />
 
-              {/* Task Switcher Pill Bar */}
               <div className="flex items-center justify-between bg-white border border-slate-200 px-4 py-2 rounded-xl text-xs font-mono shadow-xs">
                 <div className="flex items-center gap-2 overflow-x-auto max-w-full">
                   <span className="text-slate-400 font-bold uppercase text-[10px]">
@@ -239,9 +284,7 @@ function DashboardContent() {
                 </button>
               </div>
 
-              {/* 2-Column Split Workspace */}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-                {/* Left Column (5 Cols): Incident & RCA Diagnostics */}
                 <div className="lg:col-span-5 space-y-4">
                   <RCAPanel
                     task={activeTask}
@@ -250,7 +293,6 @@ function DashboardContent() {
                   />
                 </div>
 
-                {/* Right Column (7 Cols): Visual Git Diff & Decision Gate */}
                 <div className="lg:col-span-7 space-y-4">
                   <DiffViewer
                     patches={activePatches}
@@ -269,16 +311,19 @@ function DashboardContent() {
                       activeTask &&
                       rejectMutation.mutate({ taskId: activeTask.id, reason })
                     }
+                    onReset={() =>
+                      activeTask && resetMutation.mutate(activeTask.id)
+                    }
                     isRunLoading={runMutation.isPending}
                     isApproveLoading={approveMutation.isPending}
                     isRejectLoading={rejectMutation.isPending}
+                    isResetLoading={resetMutation.isPending}
                   />
                 </div>
               </div>
             </div>
           )}
 
-          {/* Tab 2: Audit & Activity Logs */}
           {currentTab === 'logs' && (
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
               <div className="lg:col-span-1">
@@ -352,7 +397,6 @@ function DashboardContent() {
         </main>
       </div>
 
-      {/* Task Creation Modal */}
       <TaskModal
         isOpen={isModalOpen}
         onClose={() => setIsModalOpen(false)}

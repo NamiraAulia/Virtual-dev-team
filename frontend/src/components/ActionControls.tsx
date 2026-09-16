@@ -20,9 +20,11 @@ interface ActionControlsProps {
   onRun: () => void;
   onApprove: (comment?: string) => void;
   onReject: (reason?: string) => void;
+  onReset?: () => void;
   isRunLoading: boolean;
   isApproveLoading: boolean;
   isRejectLoading: boolean;
+  isResetLoading?: boolean;
 }
 
 export const ActionControls: React.FC<ActionControlsProps> = ({
@@ -31,9 +33,11 @@ export const ActionControls: React.FC<ActionControlsProps> = ({
   onRun,
   onApprove,
   onReject,
+  onReset,
   isRunLoading,
   isApproveLoading,
   isRejectLoading,
+  isResetLoading = false,
 }) => {
   const { t, format } = useLanguage();
   const [copied, setCopied] = useState(false);
@@ -136,9 +140,21 @@ export const ActionControls: React.FC<ActionControlsProps> = ({
             )}
           </button>
         ) : isExploring ? (
-          <div className="w-full p-4 rounded-xl bg-indigo-50/70 border border-indigo-200 flex items-center justify-center gap-3 text-indigo-800 text-xs font-mono">
-            <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />
-            <span>{t.actionControls.agentLoopExecuting}</span>
+          <div className="w-full p-4 rounded-xl bg-indigo-50/70 border border-indigo-200 flex items-center justify-between flex-wrap gap-3 text-indigo-800 text-xs font-mono">
+            <div className="flex items-center gap-2.5">
+              <Loader2 className="w-4 h-4 animate-spin text-indigo-600 shrink-0" />
+              <span>{t.actionControls.agentLoopExecuting}</span>
+            </div>
+            {onReset && (
+              <button
+                onClick={onReset}
+                disabled={isResetLoading}
+                className="px-3 py-1.5 rounded-lg bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 hover:text-rose-600 text-xs font-semibold shadow-xs cursor-pointer disabled:opacity-50 shrink-0 transition-colors"
+                title="Reset task back to pending if stuck"
+              >
+                {isResetLoading ? 'Resetting...' : '↺ Reset / Batal'}
+              </button>
+            )}
           </div>
         ) : isApproved ? (
           <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center justify-between flex-wrap gap-2">

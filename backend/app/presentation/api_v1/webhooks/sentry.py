@@ -1,4 +1,5 @@
 from __future__ import annotations
+from app.infrastructure.security.sanitizer import DataSanitizer
 
 """
 Sentry Webhook Endpoint.
@@ -39,14 +40,17 @@ class SentryWebhookResponse(BaseModel):
 
 def parse_sentry_payload(payload: dict[str, Any], default_repo: str) -> tuple[str, str, str]:
     """
-    Extract title, description, and repo_full_name from various Sentry payload formats.
+    Extract title, description, and repo_full_name from various Sentry payload formats,
+    scrubbing any sensitive credentials or PII before storing/processing.
 
     Returns:
         tuple[title, description, repo_full_name]
     """
+    safe_payload = DataSanitizer.sanitize_dict(payload)
+
     # Format A: Issue Alert Webhook payload (data.issue)
-    if "data" in payload and "issue" in payload["data"]:
-        issue = payload["data"]["issue"]
+    if "data" in safe_payload and "issue" in safe_payload["data"]:
+        issue = safe_payload["data"]["issue"]
         title = issue.get("title", "Unhandled Runtime Error from Sentry")
         culprit = issue.get("culprit", "Unknown location")
         project_slug = issue.get("project", {}).get("slug", "")
@@ -62,11 +66,11 @@ def parse_sentry_payload(payload: dict[str, Any], default_repo: str) -> tuple[st
         )
 
     # Format B: Generic Sentry Event Webhook (event object)
-    elif "event" in payload:
-        event = payload["event"]
+    elif "event" in safe_payload:
+        event = safe_payload["event"]
         title = event.get("title", "Runtime Crash Alert")
         culprit = event.get("culprit", event.get("location", "Unknown location"))
-        project_slug = payload.get("project_slug", payload.get("project", ""))
+        project_slug = safe_payload.get("project_slug", safe_payload.get("project", ""))
 
         description = (
             f"**Source**: Sentry Event Webhook\n"
@@ -77,9 +81,9 @@ def parse_sentry_payload(payload: dict[str, Any], default_repo: str) -> tuple[st
 
     # Format C: Direct payload (fallback)
     else:
-        title = payload.get("title", "Sentry Alert")
-        culprit = payload.get("culprit", "Unknown")
-        project_slug = payload.get("project", "")
+        title = safe_payload.get("title", "Sentry Alert")
+        culprit = safe_payload.get("culprit", "Unknown")
+        project_slug = safe_payload.get("project", "")
         description = f"Sentry alert: {title} at {culprit}"
 
     # Resolve target repo (fallback to default repo if not matched)
