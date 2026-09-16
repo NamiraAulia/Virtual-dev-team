@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, useMemo, useCallback } from 'react';
 import { en, type TranslationDictionary } from '../locales/en';
 import { id } from '../locales/id';
 
@@ -32,18 +32,26 @@ export const LanguageProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     return 'en';
   });
 
-  const setLanguage = (lang: Language) => {
+  const setLanguage = useCallback((lang: Language) => {
     setLanguageState(lang);
     try {
       localStorage.setItem(STORAGE_KEY, lang);
     } catch {
       // Ignore localStorage write failures
     }
-  };
+  }, []);
 
-  const toggleLanguage = () => {
-    setLanguage(language === 'en' ? 'id' : 'en');
-  };
+  const toggleLanguage = useCallback(() => {
+    setLanguageState((prev) => {
+      const next = prev === 'en' ? 'id' : 'en';
+      try {
+        localStorage.setItem(STORAGE_KEY, next);
+      } catch {
+        // Ignore localStorage write failures
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     document.documentElement.lang = language;
@@ -51,12 +59,12 @@ export const LanguageProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const t = useMemo(() => dictionaries[language], [language]);
 
-  const format = (template: string, params?: Record<string, string | number>): string => {
+  const format = useCallback((template: string, params?: Record<string, string | number>): string => {
     if (!params) return template;
     return Object.entries(params).reduce((acc, [key, val]) => {
       return acc.replace(new RegExp(`\\{${key}\\}`, 'g'), String(val));
     }, template);
-  };
+  }, []);
 
   const value = useMemo(
     () => ({
@@ -66,12 +74,13 @@ export const LanguageProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       t,
       format,
     }),
-    [language, t]
+    [language, setLanguage, toggleLanguage, t, format]
   );
 
   return <LanguageContext.Provider value={value}>{children}</LanguageContext.Provider>;
 };
 
+// eslint-disable-next-line react-refresh/only-export-components
 export const useLanguage = (): LanguageContextType => {
   const context = useContext(LanguageContext);
   if (!context) {

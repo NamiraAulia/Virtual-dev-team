@@ -11,8 +11,9 @@ import {
   ExternalLink,
   Plus,
 } from 'lucide-react';
+import axios from 'axios';
 import { api } from './api/client';
-import type { TaskCreateInput, Task, TaskLogEntry } from './types';
+import type { TaskCreateInput, Task, TaskLogEntry, TaskDetail } from './types';
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { PipelineStages } from './components/PipelineStages';
@@ -62,6 +63,8 @@ function DashboardContent() {
     queryFn: api.getTasks,
   });
 
+  const effectiveTaskId = selectedTaskId || (tasks.length > 0 ? tasks[0].id : '');
+
   // 2. Health check
   useEffect(() => {
     const check = async () => {
@@ -89,42 +92,35 @@ function DashboardContent() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  // Auto-select first task if none selected
-  useEffect(() => {
-    if (!selectedTaskId && tasks.length > 0) {
-      setSelectedTaskId(tasks[0].id);
-    }
-  }, [tasks, selectedTaskId]);
-
   // 3. Fetch active task detail & patches (no polling needed - handled via SSE)
   const { data: taskDetail } = useQuery({
-    queryKey: ['task', selectedTaskId],
-    queryFn: () => (selectedTaskId ? api.getTask(selectedTaskId) : null),
-    enabled: !!selectedTaskId,
+    queryKey: ['task', effectiveTaskId],
+    queryFn: () => (effectiveTaskId ? api.getTask(effectiveTaskId) : null),
+    enabled: !!effectiveTaskId,
   });
 
-  const activeTask = taskDetail?.task || tasks.find((t) => t.id === selectedTaskId);
+  const activeTask = taskDetail?.task || tasks.find((t) => t.id === effectiveTaskId);
   const activePatches = taskDetail?.patches || [];
   const isExploring = activeTask?.status === 'exploring';
 
   const { data: taskLogs = [], isLoading: isLogsLoading } = useQuery({
-    queryKey: ['task_logs', selectedTaskId],
-    queryFn: () => (selectedTaskId ? api.getTaskLogs(selectedTaskId) : []),
-    enabled: !!selectedTaskId,
+    queryKey: ['task_logs', effectiveTaskId],
+    queryFn: () => (effectiveTaskId ? api.getTaskLogs(effectiveTaskId) : []),
+    enabled: !!effectiveTaskId,
   });
 
   // Real-time Server-Sent Events (SSE) Stream
   useEffect(() => {
-    if (!selectedTaskId || !isExploring) return;
+    if (!effectiveTaskId || !isExploring) return;
 
-    const streamUrl = api.getTaskStreamUrl(selectedTaskId);
+    const streamUrl = api.getTaskStreamUrl(effectiveTaskId);
     const eventSource = new EventSource(streamUrl);
 
     eventSource.onmessage = (event) => {
       try {
         const payload = JSON.parse(event.data);
         if (payload.type === 'log') {
-          qc.setQueryData<TaskLogEntry[]>(['task_logs', selectedTaskId], (oldLogs = []) => {
+          qc.setQueryData<TaskLogEntry[]>(['task_logs', effectiveTaskId], (oldLogs = []) => {
             const exists = oldLogs.some(
               (l) =>
                 l.step_number === payload.data.step_number &&
@@ -138,9 +134,9 @@ function DashboardContent() {
           payload.type === 'status_changed' ||
           payload.type === 'exploration_failed'
         ) {
-          qc.invalidateQueries({ queryKey: ['task', selectedTaskId] });
+          qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
           qc.invalidateQueries({ queryKey: ['tasks'] });
-          qc.invalidateQueries({ queryKey: ['task_logs', selectedTaskId] });
+          qc.invalidateQueries({ queryKey: ['task_logs', effectiveTaskId] });
         }
       } catch {
         // Ping or non-json message
@@ -154,7 +150,7 @@ function DashboardContent() {
     return () => {
       eventSource.close();
     };
-  }, [selectedTaskId, isExploring, qc]);
+  }, [effectiveTaskId, isExploring, qc]);
 
   // Mutations
   const createMutation = useMutation({
@@ -174,21 +170,26 @@ function DashboardContent() {
     mutationFn: ({ taskId, language, model }: { taskId: string; language: string; model: string }) =>
       api.runTask(taskId, language, model),
     onMutate: async ({ taskId }) => {
-      qc.setQueryData(['task', taskId], (old: any) => {
+      qc.setQueryData<TaskDetail | null>(['task', taskId], (old) => {
         if (!old) return old;
         return { ...old, task: { ...old.task, status: 'exploring' } };
       });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['tasks'] });
-      qc.invalidateQueries({ queryKey: ['task', selectedTaskId] });
-      qc.invalidateQueries({ queryKey: ['task_logs', selectedTaskId] });
+      qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
+      qc.invalidateQueries({ queryKey: ['task_logs', effectiveTaskId] });
     },
-    onError: (err: any) => {
+    onError: (err: unknown) => {
       qc.invalidateQueries({ queryKey: ['tasks'] });
-      qc.invalidateQueries({ queryKey: ['task', selectedTaskId] });
-      qc.invalidateQueries({ queryKey: ['task_logs', selectedTaskId] });
-      const detail = err?.response?.data?.detail || err?.message || 'Error occurred';
+      qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
+      qc.invalidateQueries({ queryKey: ['task_logs', effectiveTaskId] });
+      let detail = 'Error occurred';
+      if (axios.isAxiosError(err)) {
+        detail = err.response?.data?.detail || err.message;
+      } else if (err instanceof Error) {
+        detail = err.message;
+      }
       alert(`Autonomous AI Error: ${detail}`);
     },
   });
@@ -197,8 +198,8 @@ function DashboardContent() {
     mutationFn: (taskId: string) => api.resetTask(taskId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['tasks'] });
-      qc.invalidateQueries({ queryKey: ['task', selectedTaskId] });
-      qc.invalidateQueries({ queryKey: ['task_logs', selectedTaskId] });
+      qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
+      qc.invalidateQueries({ queryKey: ['task_logs', effectiveTaskId] });
     },
   });
 
@@ -207,7 +208,7 @@ function DashboardContent() {
       api.approveTask(taskId, comment, language),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['tasks'] });
-      qc.invalidateQueries({ queryKey: ['task', selectedTaskId] });
+      qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
     },
   });
 
@@ -216,7 +217,7 @@ function DashboardContent() {
       api.rejectTask(taskId, reason),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['tasks'] });
-      qc.invalidateQueries({ queryKey: ['task', selectedTaskId] });
+      qc.invalidateQueries({ queryKey: ['task', effectiveTaskId] });
     },
   });
 

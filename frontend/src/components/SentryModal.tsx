@@ -53,7 +53,7 @@ export const SentryModal: React.FC<SentryModalProps> = ({
       } else {
         setSimulationResult(`❌ Simulation Failed: ${data.detail || 'Error'}`);
       }
-    } catch (err) {
+    } catch {
       setSimulationResult(`❌ Backend offline or unreachable at ${webhookUrl}`);
     } finally {
       setIsSimulating(false);
